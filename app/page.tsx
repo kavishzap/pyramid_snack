@@ -583,7 +583,7 @@ function Login({ onLogin }: { onLogin: (email: string, password: string) => Prom
           >
             <label>
               Email address
-              <input name="email" type="email" autoComplete="username" defaultValue="admin@pyramidsnack.com" required />
+              <input name="email" type="email" autoComplete="username" required />
             </label>
             <label>
               Password
@@ -592,7 +592,6 @@ function Login({ onLogin }: { onLogin: (email: string, password: string) => Prom
                   name="password"
                   type={showPassword ? 'text' : 'password'}
                   autoComplete="current-password"
-                  defaultValue="admin123"
                   required
                 />
                 <button type="button" onClick={() => setShowPassword(v => !v)} aria-label={showPassword ? 'Hide password' : 'Show password'}>
@@ -699,21 +698,64 @@ function TablePagination({
   )
 }
 
-const nav = [['dashboard', 'Dashboard', LayoutDashboard], ['orders', 'Orders', ClipboardList], ['menu', 'Menu item', BookOpen], ['categories', 'Category', Tags], ['tables', 'Tables', Table2], ['expenses', 'Expenses', Receipt], ['pnl', 'P&L', BarChart3], ['sales', 'Sales report', TrendingUp], ['expense-report', 'Expense report', Wallet], ['inventory-report', 'Inventory report', Boxes], ['settings', 'Settings', Settings]] as const
+const navSections = [
+  {
+    title: 'Operations',
+    items: [
+      ['dashboard', 'Dashboard', LayoutDashboard],
+      ['orders', 'Orders', ClipboardList],
+      ['expenses', 'Expenses', Receipt],
+      ['tables', 'Tables', Table2],
+      ['menu', 'Menu item', BookOpen],
+      ['categories', 'Category', Tags],
+    ],
+  },
+  {
+    title: 'Reports',
+    items: [
+      ['pnl', 'P&L', BarChart3],
+      ['sales', 'Sales report', TrendingUp],
+      ['expense-report', 'Expense report', Wallet],
+      ['inventory-report', 'Inventory report', Boxes],
+    ],
+  },
+  {
+    title: 'System',
+    items: [['settings', 'Settings', Settings]],
+  },
+] as const
+
 function Sidebar({ active, setActive, logout, company }: { active: PageKey; setActive: (x: PageKey) => void; logout: () => void; company: CompanySettings }) {
   return (
     <aside className="sidebar">
       <div className="sidebar-top">
-        <div className="app-logo">
-          <span className="logo-icon">
-            {company.logo ? <img src={company.logo} alt="" /> : <Store size={19} />}
-          </span>
-          <span>{company.name || 'Pyramid Snack'}<small>Back office</small></span>
+        <div className={`app-logo${company.logo ? ' app-logo-with-img' : ''}`}>
+          {company.logo ? (
+            <img className="app-logo-img" src={company.logo} alt={company.name || 'Restaurant logo'} />
+          ) : (
+            <span className="logo-icon"><Store size={19} /></span>
+          )}
         </div>
       </div>
-      <nav>{nav.map(([key, label, Icon]) => <button key={key} className={`nav-item ${active === key ? 'active' : ''}`} onClick={() => setActive(key)}><Icon size={18} /><span>{label}</span></button>)}</nav>
+      <nav>
+        {navSections.map(section => (
+          <div key={section.title} className="nav-group">
+            <p>{section.title}</p>
+            {section.items.map(([key, label, Icon]) => (
+              <button key={key} className={`nav-item ${active === key ? 'active' : ''}`} onClick={() => setActive(key)}>
+                <Icon size={18} /><span>{label}</span>
+              </button>
+            ))}
+          </div>
+        ))}
+      </nav>
       <div className="sidebar-bottom">
-        <div className="user-chip"><div className="avatar">AM</div><div><strong>Alex Mootoosamy</strong><small>Administrator</small></div><button onClick={logout}><LogOut size={16} /></button></div>
+        <div className="user-chip">
+          <button type="button" onClick={logout} className="sign-out">
+            <LogOut size={16} />
+            <span>Sign out</span>
+          </button>
+        </div>
       </div>
     </aside>
   )
