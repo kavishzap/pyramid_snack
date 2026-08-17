@@ -456,6 +456,22 @@ const seedCompany: CompanySettings = {
 function Button({ children, onClick, variant = 'primary', type = 'button', className = '' }: { children: React.ReactNode; onClick?: () => void; variant?: string; type?: 'button' | 'submit'; className?: string }) { return <button type={type} onClick={onClick} className={`button button-${variant}${className ? ` ${className}` : ''}`}>{children}</button> }
 function Card({ children, className = '' }: { children: React.ReactNode; className?: string }) { return <section className={`card ${className}`}>{children}</section> }
 function Badge({ children }: { children: React.ReactNode }) { return <span className="badge">{children}</span> }
+function VatAmountCells({ inclusive, vatOn }: { inclusive: number; vatOn: boolean }) {
+  if (!vatOn) return <td className="align-right"><strong>{money(inclusive)}</strong></td>
+  const parts = vatSplit(inclusive, true)
+  return (
+    <>
+      <td className="align-right muted">{money(parts.exclusive)}</td>
+      <td className="align-right">{money(parts.vat)}</td>
+      <td className="align-right"><strong>{money(parts.inclusive)}</strong></td>
+    </>
+  )
+}
+const vatPdfCells = (inclusive: number, vatOn: boolean) => {
+  if (!vatOn) return [money(inclusive)]
+  const parts = vatSplit(inclusive, true)
+  return [money(parts.exclusive), money(parts.vat), money(parts.inclusive)]
+}
 function Dialog({ title, close, children, wide }: { title: string; close: () => void; children: React.ReactNode; wide?: boolean }) {
   return (
     <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && close()}>
@@ -1734,9 +1750,11 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
     })
     .sort((a, b) => (a.date === b.date ? b.id.localeCompare(a.id) : b.date.localeCompare(a.date)))
 
+  const vatOn = Boolean(company.vatRegistered)
   const billable = filtered.filter(o => o.status !== 'Cancelled')
   const cancelled = filtered.filter(o => o.status === 'Cancelled')
   const salesTotal = billable.reduce((sum, o) => sum + o.total, 0)
+  const salesVat = vatSplit(salesTotal, vatOn)
   const cancelledTotal = cancelled.reduce((sum, o) => sum + o.total, 0)
   const avgTicket = billable.length ? salesTotal / billable.length : 0
   const itemsSold = billable.reduce((sum, o) => sum + o.lines.reduce((s, l) => s + (Number(l.qty) || 0), 0), 0)
@@ -1800,8 +1818,10 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
         title: 'Sales report',
         period: rangeLabel,
         filename: reportFileName('sales-report'),
+        orientation: 'landscape',
         kpis: [
-          { label: company.vatRegistered ? 'Gross sales (VAT incl.)' : 'Gross sales', value: money(salesTotal) },
+          { label: vatOn ? 'Gross sales (VAT incl.)' : 'Gross sales', value: money(salesTotal) },
+          ...(vatOn ? [{ label: 'VAT on sales', value: money(salesVat.vat) }, { label: 'Excl. VAT', value: money(salesVat.exclusive) }] : []),
           { label: 'Orders', value: String(billable.length) },
           { label: 'Avg ticket', value: money(avgTicket) },
           { label: 'Items sold', value: String(itemsSold) },
@@ -1810,33 +1830,40 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
         tables: [
           {
             title: 'Orders',
-            head: ['Order', 'Date', 'Client', 'Table', 'Items', 'Status', 'Total'],
-            rightAlign: [6],
+            head: vatOn
+              ? ['Order', 'Date', 'Client', 'Table', 'Status', 'Excl. VAT', 'VAT', 'Incl. VAT']
+              : ['Order', 'Date', 'Client', 'Table', 'Status', 'Total'],
+            rightAlign: vatOn ? [5, 6, 7] : [5],
             body: filtered.map(order => [
               order.id,
               `${formatExpenseDate(order.date)} ${order.time}`,
               order.clientName || 'Walk-in guest',
               order.tableNumber,
-              order.lines.map(formatOrderLine).join(', '),
               order.status,
-              money(order.total),
+              ...vatPdfCells(order.total, vatOn),
             ]),
+            foot: ['Total (excluding cancelled)', '', '', '', '', ...vatPdfCells(salesTotal, vatOn)],
           },
           {
             title: 'By item',
-            head: ['Item', 'Qty sold', 'Revenue', 'Share'],
-            rightAlign: [1, 2, 3],
+            head: vatOn
+              ? ['Item', 'Qty sold', 'Excl. VAT', 'VAT', 'Incl. VAT', 'Share']
+              : ['Item', 'Qty sold', 'Revenue', 'Share'],
+            rightAlign: vatOn ? [1, 2, 3, 4, 5] : [1, 2, 3],
             body: itemRows.map(row => [
               row.name,
               row.qty,
-              money(row.revenue),
-              salesTotal ? `${Math.round((row.revenue / salesTotal) * 100)}%` : '—',
+              ...vatPdfCells(row.revenue, vatOn),
+              salesTotal ? `${Math.round((row.revenue / salesTotal) * 100)}%` : '-',
             ]),
+            foot: ['Total', itemsSold, ...vatPdfCells(salesTotal, vatOn), salesTotal ? '100%' : '-'],
           },
         ],
         notes: [
           'Totals use the filters currently applied on screen.',
-          company.vatRegistered ? 'Amounts are VAT inclusive.' : 'The company is not VAT registered.',
+          company.vatRegistered
+            ? `Amounts are VAT inclusive at ${Math.round(VAT_RATE * 100)}%. Excl. VAT = inclusive / 1.${Math.round(VAT_RATE * 100)}.`
+            : 'The company is not VAT registered.',
           'Cancelled orders are listed but excluded from gross sales.',
         ],
       })
@@ -1884,9 +1911,16 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
 
       <div className="sales-summary">
         <div className="sales-kpi">
-          <span>Gross sales{company.vatRegistered ? ' · VAT incl.' : ''}</span>
+          <span>Gross sales{vatOn ? ' · VAT incl.' : ''}</span>
           <strong>{money(salesTotal)}</strong>
         </div>
+        {vatOn && (
+          <div className="sales-kpi">
+            <span>VAT on sales</span>
+            <strong>{money(salesVat.vat)}</strong>
+            <em>{money(salesVat.exclusive)} excl.</em>
+          </div>
+        )}
         <div className="sales-kpi">
           <span>Orders</span>
           <strong>{billable.length}</strong>
@@ -1930,7 +1964,15 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
                   <th>Table</th>
                   <th>Items</th>
                   <th>Status</th>
-                  <th className="align-right">Total</th>
+                  {vatOn ? (
+                    <>
+                      <th className="align-right">Excl. VAT</th>
+                      <th className="align-right">VAT</th>
+                      <th className="align-right">Incl. VAT</th>
+                    </>
+                  ) : (
+                    <th className="align-right">Total</th>
+                  )}
                 </tr>
               </thead>
               <tbody>
@@ -1953,11 +1995,19 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
                         {order.status}
                       </span>
                     </td>
-                    <td className="align-right"><strong>{money(order.total)}</strong></td>
+                    <VatAmountCells inclusive={order.total} vatOn={vatOn} />
                   </tr>
                 ))}
-                {!filtered.length && <tr><td colSpan={6} className="muted">No orders match these filters.</td></tr>}
+                {!filtered.length && <tr><td colSpan={vatOn ? 8 : 6} className="muted">No orders match these filters.</td></tr>}
               </tbody>
+              {!!filtered.length && (
+                <tfoot>
+                  <tr>
+                    <td colSpan={5}><strong>Total (excluding cancelled)</strong></td>
+                    <VatAmountCells inclusive={salesTotal} vatOn={vatOn} />
+                  </tr>
+                </tfoot>
+              )}
             </table>
           </div>
         ) : (
@@ -1968,7 +2018,15 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
                   <th>#</th>
                   <th>Item</th>
                   <th className="align-right">Qty sold</th>
-                  <th className="align-right">Revenue</th>
+                  {vatOn ? (
+                    <>
+                      <th className="align-right">Excl. VAT</th>
+                      <th className="align-right">VAT</th>
+                      <th className="align-right">Incl. VAT</th>
+                    </>
+                  ) : (
+                    <th className="align-right">Revenue</th>
+                  )}
                   <th className="align-right">Share</th>
                 </tr>
               </thead>
@@ -1978,12 +2036,21 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
                     <td className="muted">{(itemsPaged.page - 1) * itemsPaged.pageSize + index + 1}</td>
                     <td><strong>{row.name}</strong></td>
                     <td className="align-right">{row.qty}</td>
-                    <td className="align-right"><strong>{money(row.revenue)}</strong></td>
+                    <VatAmountCells inclusive={row.revenue} vatOn={vatOn} />
                     <td className="align-right muted">{salesTotal ? `${Math.round((row.revenue / salesTotal) * 100)}%` : '—'}</td>
                   </tr>
                 ))}
-                {!itemRows.length && <tr><td colSpan={5} className="muted">No item sales in this filter.</td></tr>}
+                {!itemRows.length && <tr><td colSpan={vatOn ? 7 : 5} className="muted">No item sales in this filter.</td></tr>}
               </tbody>
+              {!!itemRows.length && (
+                <tfoot>
+                  <tr>
+                    <td colSpan={3}><strong>Total</strong></td>
+                    <VatAmountCells inclusive={salesTotal} vatOn={vatOn} />
+                    <td className="align-right muted">{salesTotal ? '100%' : '—'}</td>
+                  </tr>
+                </tfoot>
+              )}
             </table>
           </div>
         )}
@@ -2436,8 +2503,10 @@ function InventoryReport({ orders, menu, company, toast }: { orders: Order[]; me
     return true
   })
 
+  const vatOn = Boolean(company.vatRegistered)
   const qtySold = filtered.reduce((sum, row) => sum + row.qty, 0)
   const revenue = filtered.reduce((sum, row) => sum + row.revenue, 0)
+  const revenueVat = vatSplit(revenue, vatOn)
   const uniqueItems = filtered.length
   const ordersWithFilteredItems = new Set(
     Object.values(soldMap)
@@ -2503,44 +2572,54 @@ function InventoryReport({ orders, menu, company, toast }: { orders: Order[]; me
         title: 'Inventory report',
         period: rangeLabel,
         filename: reportFileName('inventory-report'),
+        orientation: 'landscape',
         kpis: [
           { label: 'Qty sold', value: String(qtySold) },
           { label: 'Unique items', value: String(uniqueItems) },
           { label: 'Completed orders', value: String(completedInRange.length) },
-          { label: company.vatRegistered ? 'Revenue (VAT incl.)' : 'Revenue', value: money(revenue) },
+          { label: vatOn ? 'Revenue (VAT incl.)' : 'Revenue', value: money(revenue) },
+          ...(vatOn ? [{ label: 'VAT on sales', value: money(revenueVat.vat) }, { label: 'Excl. VAT', value: money(revenueVat.exclusive) }] : []),
         ],
         tables: [
           {
             title: 'Items sold (completed orders only)',
-            head: ['Item', 'Type', 'Category', 'Qty sold', 'Orders', 'Revenue', 'Share'],
-            rightAlign: [3, 4, 5, 6],
+            head: vatOn
+              ? ['Item', 'Type', 'Category', 'Qty sold', 'Orders', 'Excl. VAT', 'VAT', 'Incl. VAT', 'Share']
+              : ['Item', 'Type', 'Category', 'Qty sold', 'Orders', 'Revenue', 'Share'],
+            rightAlign: vatOn ? [3, 4, 5, 6, 7, 8] : [3, 4, 5, 6],
             body: filtered.map(row => [
               row.name,
               row.addOn ? 'Add-on' : 'Item',
               row.category,
               row.qty,
               row.orders,
-              money(row.revenue),
-              revenue ? `${Math.round((row.revenue / revenue) * 100)}%` : '—',
+              ...vatPdfCells(row.revenue, vatOn),
+              revenue ? `${Math.round((row.revenue / revenue) * 100)}%` : '-',
             ]),
+            foot: ['Total', '', '', qtySold, '', ...vatPdfCells(revenue, vatOn), revenue ? '100%' : '-'],
           },
           {
             title: 'By category',
-            head: ['Category', 'Items', 'Qty sold', 'Revenue', 'Share'],
-            rightAlign: [1, 2, 3, 4],
+            head: vatOn
+              ? ['Category', 'Items', 'Qty sold', 'Excl. VAT', 'VAT', 'Incl. VAT', 'Share']
+              : ['Category', 'Items', 'Qty sold', 'Revenue', 'Share'],
+            rightAlign: vatOn ? [1, 2, 3, 4, 5, 6] : [1, 2, 3, 4],
             body: categoryRows.map(row => [
               row.name,
               row.items,
               row.qty,
-              money(row.revenue),
-              revenue ? `${Math.round((row.revenue / revenue) * 100)}%` : '—',
+              ...vatPdfCells(row.revenue, vatOn),
+              revenue ? `${Math.round((row.revenue / revenue) * 100)}%` : '-',
             ]),
+            foot: ['Total', uniqueItems, qtySold, ...vatPdfCells(revenue, vatOn), revenue ? '100%' : '-'],
           },
         ],
         notes: [
           'Only completed orders are included.',
           'Totals use the filters currently applied on screen.',
-          company.vatRegistered ? 'Amounts are VAT inclusive.' : 'The company is not VAT registered.',
+          company.vatRegistered
+            ? `Amounts are VAT inclusive at ${Math.round(VAT_RATE * 100)}%. Excl. VAT = inclusive / 1.${Math.round(VAT_RATE * 100)}.`
+            : 'The company is not VAT registered.',
         ],
       })
       toast('Inventory report PDF downloaded')
@@ -2596,9 +2675,16 @@ function InventoryReport({ orders, menu, company, toast }: { orders: Order[]; me
           <strong>{completedInRange.length}</strong>
         </div>
         <div className="sales-kpi">
-          <span>Revenue{company.vatRegistered ? ' · VAT incl.' : ''}</span>
+          <span>Revenue{vatOn ? ' · VAT incl.' : ''}</span>
           <strong>{money(revenue)}</strong>
         </div>
+        {vatOn && (
+          <div className="sales-kpi">
+            <span>VAT on sales</span>
+            <strong>{money(revenueVat.vat)}</strong>
+            <em>{money(revenueVat.exclusive)} excl.</em>
+          </div>
+        )}
         <div className="sales-kpi muted-kpi">
           <span>Orders with matches</span>
           <strong>{ordersWithFilteredItems}</strong>
@@ -2628,7 +2714,15 @@ function InventoryReport({ orders, menu, company, toast }: { orders: Order[]; me
                   <th>Category</th>
                   <th className="align-right">Qty sold</th>
                   <th className="align-right">Orders</th>
-                  <th className="align-right">Revenue</th>
+                  {vatOn ? (
+                    <>
+                      <th className="align-right">Excl. VAT</th>
+                      <th className="align-right">VAT</th>
+                      <th className="align-right">Incl. VAT</th>
+                    </>
+                  ) : (
+                    <th className="align-right">Revenue</th>
+                  )}
                   <th className="align-right">Share</th>
                 </tr>
               </thead>
@@ -2643,12 +2737,21 @@ function InventoryReport({ orders, menu, company, toast }: { orders: Order[]; me
                     <td><Badge>{row.category}</Badge></td>
                     <td className="align-right"><strong>{row.qty}</strong></td>
                     <td className="align-right muted">{row.orders}</td>
-                    <td className="align-right"><strong>{money(row.revenue)}</strong></td>
+                    <VatAmountCells inclusive={row.revenue} vatOn={vatOn} />
                     <td className="align-right muted">{revenue ? `${Math.round((row.revenue / revenue) * 100)}%` : '—'}</td>
                   </tr>
                 ))}
-                {!filtered.length && <tr><td colSpan={7} className="muted">No completed order items match these filters.</td></tr>}
+                {!filtered.length && <tr><td colSpan={vatOn ? 9 : 7} className="muted">No completed order items match these filters.</td></tr>}
               </tbody>
+              {!!filtered.length && (
+                <tfoot>
+                  <tr>
+                    <td colSpan={5}><strong>Total</strong></td>
+                    <VatAmountCells inclusive={revenue} vatOn={vatOn} />
+                    <td className="align-right muted">{revenue ? '100%' : '—'}</td>
+                  </tr>
+                </tfoot>
+              )}
             </table>
           </div>
         ) : (
@@ -2660,7 +2763,15 @@ function InventoryReport({ orders, menu, company, toast }: { orders: Order[]; me
                   <th>Category</th>
                   <th className="align-right">Items</th>
                   <th className="align-right">Qty sold</th>
-                  <th className="align-right">Revenue</th>
+                  {vatOn ? (
+                    <>
+                      <th className="align-right">Excl. VAT</th>
+                      <th className="align-right">VAT</th>
+                      <th className="align-right">Incl. VAT</th>
+                    </>
+                  ) : (
+                    <th className="align-right">Revenue</th>
+                  )}
                   <th className="align-right">Share</th>
                 </tr>
               </thead>
@@ -2671,12 +2782,21 @@ function InventoryReport({ orders, menu, company, toast }: { orders: Order[]; me
                     <td><strong>{row.name}</strong></td>
                     <td className="align-right">{row.items}</td>
                     <td className="align-right"><strong>{row.qty}</strong></td>
-                    <td className="align-right"><strong>{money(row.revenue)}</strong></td>
+                    <VatAmountCells inclusive={row.revenue} vatOn={vatOn} />
                     <td className="align-right muted">{revenue ? `${Math.round((row.revenue / revenue) * 100)}%` : '—'}</td>
                   </tr>
                 ))}
-                {!categoryRows.length && <tr><td colSpan={6} className="muted">No category inventory in this filter.</td></tr>}
+                {!categoryRows.length && <tr><td colSpan={vatOn ? 8 : 6} className="muted">No category inventory in this filter.</td></tr>}
               </tbody>
+              {!!categoryRows.length && (
+                <tfoot>
+                  <tr>
+                    <td colSpan={4}><strong>Total</strong></td>
+                    <VatAmountCells inclusive={revenue} vatOn={vatOn} />
+                    <td className="align-right muted">{revenue ? '100%' : '—'}</td>
+                  </tr>
+                </tfoot>
+              )}
             </table>
           </div>
         )}
@@ -2798,7 +2918,7 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
       ? { exclusive: inclusiveAmount, vat: 0, inclusive: inclusiveAmount }
       : vatSplit(inclusiveAmount, vatOn)
     return vatOn
-      ? [money(parts.exclusive), opts?.noVat ? '—' : money(parts.vat), money(parts.inclusive)]
+      ? [money(parts.exclusive), opts?.noVat ? '-' : money(parts.vat), money(parts.inclusive)]
       : [money(parts.inclusive)]
   }
   const pnlRow = (label: string, inclusiveAmount: number, opts?: { indent?: boolean; noVat?: boolean }) => [
@@ -2824,9 +2944,9 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
         pnlRow('Profit / (loss) before tax', profitBeforeTaxIncl),
         pnlRow('Income tax expense (estimated at 15%)', -incomeTaxExpense, { noVat: true }),
         vatOn
-          ? ['Profit / (loss) for the period', money(profitForPeriodExcl), '—', money(profitForPeriodIncl)]
+          ? ['Profit / (loss) for the period', money(profitForPeriodExcl), '-', money(profitForPeriodIncl)]
           : pnlRow('Profit / (loss) for the period', profitForPeriodIncl),
-        ...(vatOn ? [pnlRow('Net VAT position (output − input)', netVat)] : []),
+        ...(vatOn ? [['Net VAT position (output minus input)', '-', money(netVat), '-']] : []),
       ]
       const denom = vatOn ? revenueExcl : revenueIncl
       await downloadReportPdf({
@@ -2835,8 +2955,8 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
         period: periodLabel,
         filename: reportFileName('pnl-report'),
         kpis: [
-          { label: 'Gross margin', value: denom ? `${Math.round((grossProfitExcl / denom) * 100)}%` : '—' },
-          { label: 'Net margin', value: denom ? `${Math.round((profitForPeriodExcl / denom) * 100)}%` : '—' },
+          { label: 'Gross margin', value: denom ? `${Math.round((grossProfitExcl / denom) * 100)}%` : '-' },
+          { label: 'Net margin', value: denom ? `${Math.round((profitForPeriodExcl / denom) * 100)}%` : '-' },
           { label: vatOn ? 'Net VAT' : 'Orders in period', value: vatOn ? money(netVat) : String(periodOrders.length) },
           { label: vatOn ? 'VAT incl. profit' : 'Profit for period', value: money(profitForPeriodIncl) },
         ],
@@ -2943,7 +3063,14 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
                   <td className={`align-right ${profitForPeriodIncl < 0 ? 'negative' : ''}`}>{money(profitForPeriodIncl)}</td>
                 </tr>
               ) : row('Profit / (loss) for the period', profitForPeriodIncl, { total: true, bold: true })}
-              {vatOn && row('Net VAT position (output − input)', netVat, { bold: true })}
+              {vatOn && (
+                <tr className="pnl-bold">
+                  <td>Net VAT position (output minus input)</td>
+                  <td className="align-right muted">—</td>
+                  <td className={`align-right ${netVat < 0 ? 'negative' : ''}`}>{money(netVat)}</td>
+                  <td className="align-right muted">—</td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -2965,7 +3092,7 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
       <div className="metric-grid expense-metrics" style={{ marginTop: 18 }}>
         <Card className="metric-card"><p>Gross margin</p><strong>{(vatOn ? revenueExcl : revenueIncl) ? `${Math.round((grossProfitExcl / (vatOn ? revenueExcl : revenueIncl)) * 100)}%` : '—'}</strong><span className="muted">{vatOn ? 'On excl. VAT revenue' : 'Gross profit ÷ revenue'}</span></Card>
         <Card className="metric-card"><p>Net margin</p><strong className={profitForPeriodExcl >= 0 ? 'positive' : 'negative'}>{(vatOn ? revenueExcl : revenueIncl) ? `${Math.round((profitForPeriodExcl / (vatOn ? revenueExcl : revenueIncl)) * 100)}%` : '—'}</strong><span className="muted">Profit after tax ÷ revenue</span></Card>
-        <Card className="metric-card"><p>{vatOn ? 'Net VAT' : 'Orders in period'}</p><strong>{vatOn ? money(netVat) : periodOrders.length}</strong><span className="muted">{vatOn ? 'Output − input VAT' : `${periodExpenses.length} expense entries`}</span></Card>
+        <Card className="metric-card"><p>{vatOn ? 'Net VAT' : 'Orders in period'}</p><strong>{vatOn ? money(netVat) : periodOrders.length}</strong><span className="muted">{vatOn ? 'Output minus input VAT' : `${periodExpenses.length} expense entries`}</span></Card>
       </div>
     </div>
   )

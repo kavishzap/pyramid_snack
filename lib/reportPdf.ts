@@ -6,6 +6,7 @@ type PdfTable = {
   title?: string
   head: string[]
   body: (string | number)[][]
+  foot?: (string | number)[]
   rightAlign?: number[]
 }
 
@@ -20,6 +21,18 @@ const stamp = () =>
 
 export const reportFileName = (slug: string) =>
   `${slug}-${new Date().toISOString().slice(0, 10)}.pdf`
+
+/** Helvetica (WinAnsi) cannot draw Unicode minus/dashes — they become garbage like `"`. */
+const pdfSafe = (value: string | number) =>
+  String(value)
+    .replace(/\u2212/g, '-')
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
+    .replace(/[\u2018\u2019\u02BC]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/\u00B7/g, ' | ')
+    .replace(/[^\x20-\x7E]/g, ' ')
+    .replace(/ {2,}/g, ' ')
+    .trim()
 
 const lastTableY = (doc: jsPDF, fallback: number) => {
   const y = (doc as jsPDF & { lastAutoTable?: { finalY: number } }).lastAutoTable?.finalY
@@ -37,7 +50,7 @@ const drawFooter = (doc: jsPDF, companyName: string) => {
     doc.line(14, height - 14, width - 14, height - 14)
     doc.setFontSize(8)
     doc.setTextColor(...muted)
-    doc.text(companyName, 14, height - 9)
+    doc.text(pdfSafe(companyName), 14, height - 9)
     doc.text(`Page ${i} of ${pageCount}`, width - 14, height - 9, { align: 'right' })
   }
 }
@@ -70,13 +83,13 @@ const drawLetterhead = (doc: jsPDF, company: CompanySettings, title: string, per
   doc.setFont('helvetica', 'bold')
   doc.setFontSize(16)
   doc.setTextColor(...ink)
-  doc.text(name, x, 20)
+  doc.text(pdfSafe(name), x, 20)
   doc.setFont('helvetica', 'normal')
   doc.setFontSize(8.5)
   doc.setTextColor(...muted)
   let y = 25
   lines.forEach(line => {
-    doc.text(line, x, y)
+    doc.text(pdfSafe(line), x, y)
     y += 4.2
   })
 
@@ -89,13 +102,13 @@ const drawLetterhead = (doc: jsPDF, company: CompanySettings, title: string, per
   doc.setFont('helvetica', 'bold')
   doc.setFontSize(14)
   doc.setTextColor(...ink)
-  doc.text(title, 14, y)
+  doc.text(pdfSafe(title), 14, y)
   y += 6
   doc.setFont('helvetica', 'normal')
   doc.setFontSize(9.5)
   doc.setTextColor(...muted)
-  doc.text(`Period: ${period}`, 14, y)
-  doc.text(`Generated ${stamp()}`, doc.internal.pageSize.getWidth() - 14, y, { align: 'right' })
+  doc.text(pdfSafe(`Period: ${period}`), 14, y)
+  doc.text(pdfSafe(`Generated ${stamp()}`), doc.internal.pageSize.getWidth() - 14, y, { align: 'right' })
   return y + 6
 }
 
@@ -107,6 +120,7 @@ export async function downloadReportPdf({
   kpis = [],
   tables,
   notes = [],
+  orientation = 'portrait',
 }: {
   company: CompanySettings
   title: string
@@ -115,9 +129,12 @@ export async function downloadReportPdf({
   kpis?: PdfKpi[]
   tables: PdfTable[]
   notes?: string[]
+  orientation?: 'portrait' | 'landscape'
 }) {
-  const doc = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' })
+  const doc = new jsPDF({ unit: 'mm', format: 'a4', orientation })
   const pageWidth = doc.internal.pageSize.getWidth()
+  const isLandscape = orientation === 'landscape'
+  const pageBreakY = isLandscape ? 170 : 250
   let y = drawLetterhead(doc, company, title, period)
 
   if (kpis.length) {
@@ -126,8 +143,8 @@ export async function downloadReportPdf({
       theme: 'plain',
       styles: { fontSize: 8.5, cellPadding: 3, textColor: [...ink] },
       columnStyles: Object.fromEntries(kpis.map((_, i) => [i, { halign: 'left' as const }])),
-      head: [kpis.map(k => k.label)],
-      body: [kpis.map(k => k.value)],
+      head: [kpis.map(k => pdfSafe(k.label))],
+      body: [kpis.map(k => pdfSafe(k.value))],
       headStyles: { fillColor: [246, 241, 231], textColor: [...muted], fontStyle: 'bold', fontSize: 7.5 },
       bodyStyles: { fontStyle: 'bold', fontSize: 10 },
       margin: { left: 14, right: 14 },
@@ -136,7 +153,7 @@ export async function downloadReportPdf({
   }
 
   tables.forEach(table => {
-    if (y > 250) {
+    if (y > pageBreakY) {
       doc.addPage()
       y = 18
     }
@@ -144,20 +161,29 @@ export async function downloadReportPdf({
       doc.setFont('helvetica', 'bold')
       doc.setFontSize(11)
       doc.setTextColor(...ink)
-      doc.text(table.title, 14, y)
+      doc.text(pdfSafe(table.title), 14, y)
       y += 4
     }
     const right = new Set(table.rightAlign ?? [])
     autoTable(doc, {
       startY: y,
-      head: [table.head],
-      body: table.body.length ? table.body : [table.head.map(() => '—')],
+      head: [table.head.map(pdfSafe)],
+      body: (table.body.length ? table.body : [table.head.map(() => '-')]).map(row => row.map(pdfSafe)),
+      foot: table.foot ? [table.foot.map(pdfSafe)] : undefined,
+      showFoot: table.foot ? 'lastPage' : undefined,
       theme: 'grid',
-      styles: { fontSize: 8, cellPadding: 2.2, textColor: [...ink], lineColor: [226, 218, 204], lineWidth: 0.2 },
-      headStyles: { fillColor: [...forest], textColor: 255, fontStyle: 'bold', fontSize: 8 },
+      styles: { fontSize: isLandscape ? 8 : 7.5, cellPadding: 2, textColor: [...ink], lineColor: [226, 218, 204], lineWidth: 0.2, overflow: 'linebreak' },
+      headStyles: { fillColor: [...forest], textColor: 255, fontStyle: 'bold', fontSize: 8, overflow: 'linebreak' },
+      footStyles: { fillColor: [246, 241, 231], textColor: [...ink], fontStyle: 'bold', fontSize: 8 },
       alternateRowStyles: { fillColor: [252, 249, 243] },
       columnStyles: Object.fromEntries(
-        table.head.map((_, i) => [i, { halign: right.has(i) ? 'right' as const : 'left' as const }])
+        table.head.map((label, i) => {
+          const moneyCol = /VAT|Total|Revenue|MUR|Share/i.test(String(label))
+          return [i, {
+            halign: right.has(i) ? 'right' as const : 'left' as const,
+            ...(moneyCol ? { cellWidth: String(label) === 'VAT' ? 22 : 28 } : {}),
+          }]
+        })
       ),
       margin: { left: 14, right: 14, bottom: 18 },
     })
@@ -165,7 +191,7 @@ export async function downloadReportPdf({
   })
 
   if (notes.length) {
-    if (y > 240) {
+    if (y > pageBreakY - 10) {
       doc.addPage()
       y = 18
     }
@@ -178,8 +204,8 @@ export async function downloadReportPdf({
     doc.setFontSize(8.5)
     doc.setTextColor(...muted)
     notes.forEach((note, i) => {
-      const wrapped = doc.splitTextToSize(`${i + 1}. ${note}`, pageWidth - 28)
-      if (y + wrapped.length * 4 > 275) {
+      const wrapped = doc.splitTextToSize(pdfSafe(`${i + 1}. ${note}`), pageWidth - 28)
+      if (y + wrapped.length * 4 > doc.internal.pageSize.getHeight() - 20) {
         doc.addPage()
         y = 18
       }
