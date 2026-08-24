@@ -107,6 +107,7 @@ export type Database = {
           table_number: number
           dining_table_id: string | null
           status: 'new' | 'completed' | 'cancelled'
+          payment_method: 'cash' | 'bank' | 'credit'
           order_date: string
           order_time: string
           total_amount: number
@@ -122,6 +123,7 @@ export type Database = {
           table_number: number
           dining_table_id?: string | null
           status?: 'new' | 'completed' | 'cancelled'
+          payment_method?: 'cash' | 'bank' | 'credit'
           order_date?: string
           order_time?: string
           total_amount?: number
@@ -199,6 +201,8 @@ export type Database = {
           category_id: string
           notes: string
           total_amount: number
+          vat_inclusive: boolean
+          vat_claimable: boolean
           created_by: string | null
           created_at: string
           updated_at: string
@@ -209,6 +213,8 @@ export type Database = {
           category_id: string
           notes?: string
           total_amount?: number
+          vat_inclusive?: boolean
+          vat_claimable?: boolean
           created_by?: string | null
         }
         Update: Partial<Database['public']['Tables']['expenses']['Row']>

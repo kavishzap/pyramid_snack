@@ -7,7 +7,16 @@ BEGIN;
 DROP FUNCTION IF EXISTS public.ensure_my_restaurant();
 DROP FUNCTION IF EXISTS public.user_tenant_ids();
 DROP FUNCTION IF EXISTS public.link_auth_user_to_tenant(text, text);
+DROP FUNCTION IF EXISTS public.seed_chart_of_accounts(uuid);
 
+DROP TABLE IF EXISTS public.journal_lines CASCADE;
+DROP TABLE IF EXISTS public.journal_entries CASCADE;
+DROP TABLE IF EXISTS public.supplier_payments CASCADE;
+DROP TABLE IF EXISTS public.money_receipts CASCADE;
+DROP TABLE IF EXISTS public.purchase_lines CASCADE;
+DROP TABLE IF EXISTS public.purchases CASCADE;
+DROP TABLE IF EXISTS public.suppliers CASCADE;
+DROP TABLE IF EXISTS public.gl_accounts CASCADE;
 DROP TABLE IF EXISTS public.expense_lines CASCADE;
 DROP TABLE IF EXISTS public.expenses CASCADE;
 DROP TABLE IF EXISTS public.expense_categories CASCADE;

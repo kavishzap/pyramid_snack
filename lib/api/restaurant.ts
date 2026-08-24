@@ -309,6 +309,7 @@ export async function fetchOrders(tenantId: string): Promise<Order[]> {
       total: Number(row.total_amount ?? 0),
       time,
       date: String(row.order_date ?? ''),
+      paymentMethod: row.payment_method === 'bank' || row.payment_method === 'credit' ? row.payment_method : 'cash',
       _dbId: String(row.id),
     } as Order & { _dbId?: string }
   })
@@ -341,6 +342,7 @@ export async function saveOrder(tenantId: string, order: Order, dbId?: string | 
     order_date: order.date,
     order_time: time,
     total_amount: total,
+    payment_method: order.paymentMethod === 'bank' || order.paymentMethod === 'credit' ? order.paymentMethod : 'cash',
   }
 
   if (orderDbId) {
@@ -435,6 +437,8 @@ export async function fetchExpenses(tenantId: string): Promise<Expense[]> {
       date: String(row.expense_date ?? ''),
       category: String(cat?.name ?? ''),
       categoryId: String(row.category_id ?? ''),
+      vatInclusive: row.vat_inclusive !== false,
+      vatClaimable: row.vat_claimable !== false,
       lines: linesRaw
         .sort((a, b) => Number(a.sort_order ?? 0) - Number(b.sort_order ?? 0))
         .map(line => ({
@@ -455,6 +459,8 @@ export async function saveExpense(tenantId: string, expense: Expense, categoryId
     expense_date: expense.date,
     category_id: categoryId,
     total_amount: total,
+    vat_inclusive: expense.vatInclusive !== false,
+    vat_claimable: expense.vatClaimable !== false,
   }
 
   let expenseId = expense.id || null

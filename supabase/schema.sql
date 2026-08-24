@@ -141,6 +141,8 @@ CREATE TABLE expenses (
   category_id     UUID NOT NULL REFERENCES expense_categories(id),
   notes           TEXT NOT NULL DEFAULT '',
   total_amount    NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (total_amount >= 0),
+  vat_inclusive   BOOLEAN NOT NULL DEFAULT TRUE,
+  vat_claimable   BOOLEAN NOT NULL DEFAULT TRUE,
   created_by      UUID REFERENCES auth.users(id) ON DELETE SET NULL,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -314,6 +316,8 @@ COMMIT;
 -- Usage:
 -- 1) Run 01-reset.sql
 -- 2) Run this file
--- 3) Create a user in Authentication → Users (email + password)
--- 4) Sign in with that email/password — their restaurant is created automatically
--- 5) Another Auth user = another separate restaurant
+-- 3) Run 04-accounting.sql (ledger, journals, purchases)
+-- 4) Run 05-vat-treatment.sql if 04 was already applied without VAT flags
+-- 5) Create a user in Authentication → Users (email + password)
+-- 6) Sign in with that email/password — their restaurant is created automatically
+-- 7) Another Auth user = another separate restaurant

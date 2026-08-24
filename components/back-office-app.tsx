@@ -1,8 +1,10 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import Link from 'next/link'
+import { usePathname, useRouter } from 'next/navigation'
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { BarChart3, BookOpen, Boxes, CalendarDays, Check, ChevronLeft, ChevronRight, CircleDollarSign, ClipboardList, Download, Eye, LayoutDashboard, LogOut, Menu as MenuIcon, Moon, MoreHorizontal, Plus, Receipt, Search, Settings, Sparkles, Store, Sun, Table2, Tags, TrendingUp, Users, Wallet, X, Trash2 } from 'lucide-react'
+import { BarChart3, BookMarked, BookOpen, Boxes, CalendarDays, Check, ChevronLeft, ChevronRight, CircleDollarSign, ClipboardList, Download, Eye, LayoutDashboard, LogOut, Menu as MenuIcon, Moon, MoreHorizontal, Plus, Receipt, Search, Settings, Sparkles, Store, Sun, Table2, Tags, TrendingUp, Users, Wallet, X, Trash2, ShoppingCart, ScrollText } from 'lucide-react'
 
 import {
   type Category,
@@ -15,13 +17,29 @@ import {
   type OrderAddOn,
   type OrderLine,
   type OrderStatus,
+  type PayMethod,
   newId,
 } from '@/lib/domain'
 import { isSupabaseConfigured } from '@/lib/supabase/client'
 import * as api from '@/lib/api/restaurant'
+import * as booksApi from '@/lib/api/accounting'
+import { CashBookPage, JournalsPage, LedgerPage, PurchasesPage, VatBreakdown, VatToggleRow } from '@/components/accounting-pages'
+import {
+  type AccountingBooks,
+  type Purchase,
+  buildExpenseJournal,
+  buildSaleJournal,
+  documentVat,
+  emptyBooks,
+  expenseAccountCode,
+  purchaseTotal,
+  removeJournal,
+  upsertJournal,
+  VAT_RATE,
+  vatSplit,
+} from '@/lib/accounting'
 import { downloadReportPdf, reportFileName } from '@/lib/reportPdf'
-
-type PageKey = 'dashboard' | 'menu' | 'categories' | 'tables' | 'orders' | 'expenses' | 'pnl' | 'sales' | 'expense-report' | 'inventory-report' | 'settings'
+import { PAGE_PATH, PAGE_TITLES, pageFromPath, type PageKey } from '@/lib/routes'
 
 const expenseCategories = [
   'Produce',
@@ -72,18 +90,6 @@ const adminExpenseCategories = new Set<string>([
 ])
 
 const CORPORATE_TAX_RATE = 0.15 // Mauritius headline company tax rate under the Income Tax Act
-const VAT_RATE = 0.15 // Mauritius standard VAT rate
-const vatSplit = (inclusiveAmount: number, vatRegistered: boolean) => {
-  const sign = inclusiveAmount < 0 ? -1 : 1
-  const inclusive = Math.abs(inclusiveAmount)
-  if (!vatRegistered || inclusive === 0) {
-    return { exclusive: inclusiveAmount, vat: 0, inclusive: inclusiveAmount }
-  }
-  const exclusive = inclusive / (1 + VAT_RATE)
-  const vat = inclusive - exclusive
-  return { exclusive: exclusive * sign, vat: vat * sign, inclusive: inclusiveAmount }
-}
-const excl = (inclusiveAmount: number, vatRegistered: boolean) => vatSplit(inclusiveAmount, vatRegistered).exclusive
 
 type ExpenseBucket = 'cogs' | 'distribution' | 'admin' | 'other'
 const expenseBucket = (category: string): ExpenseBucket => {
@@ -114,6 +120,15 @@ const formatProfitCoefficient = (sellingPrice: number, manufacturedPrice: number
 }
 const expenseLineTotal = (line: ExpenseLine) => (Number(line.qty) || 0) * (Number(line.amount) || 0)
 const expenseTotal = (e: Expense) => e.lines.reduce((sum, line) => sum + expenseLineTotal(line), 0)
+const expenseSpend = (e: Expense, vatOn: boolean) => documentVat(expenseTotal(e), e, vatOn).payable
+const expensePnl = (e: Expense, vatOn: boolean) => {
+  const parts = documentVat(expenseTotal(e), e, vatOn)
+  return { exclusive: parts.expense, vat: parts.inputVat, inclusive: parts.payable }
+}
+const purchasePnl = (purchase: Purchase, vatOn: boolean) => {
+  const parts = documentVat(purchaseTotal(purchase), purchase, vatOn)
+  return { exclusive: parts.expense, vat: parts.inputVat, inclusive: parts.payable }
+}
 const formatExpenseDate = (iso: string) => {
   const d = new Date(`${iso}T00:00:00`)
   if (Number.isNaN(d.getTime())) return iso
@@ -197,10 +212,13 @@ const normalizeOrder = (raw: Record<string, unknown>, index: number): Order => {
     total: computed > 0 ? computed : storedTotal,
     time: String(raw.time ?? ''),
     date: parseExpenseDate(String(raw.date ?? new Date().toISOString().slice(0, 10))),
+    paymentMethod: raw.paymentMethod === 'bank' || raw.paymentMethod === 'credit' || raw.payment_method === 'bank' || raw.payment_method === 'credit'
+      ? (String(raw.paymentMethod ?? raw.payment_method) as Order['paymentMethod'])
+      : 'cash',
   }
 }
-const sumOrders = (list: Order[]) => list.filter(o => o.status !== 'Cancelled').reduce((sum, o) => sum + o.total, 0)
-const sumExpenses = (list: Expense[]) => list.reduce((sum, e) => sum + expenseTotal(e), 0)
+const sumOrders = (list: Order[]) => list.filter(o => o.status === 'Completed').reduce((sum, o) => sum + o.total, 0)
+const sumExpenses = (list: Expense[], vatOn: boolean) => list.reduce((sum, e) => sum + expenseSpend(e, vatOn), 0)
 const monthLabels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
 const seedMenu: MenuItem[] = [
@@ -473,12 +491,20 @@ const vatPdfCells = (inclusive: number, vatOn: boolean) => {
   return [money(parts.exclusive), money(parts.vat), money(parts.inclusive)]
 }
 function Dialog({ title, close, children, wide }: { title: string; close: () => void; children: React.ReactNode; wide?: boolean }) {
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') e.stopPropagation()
+    }
+    window.addEventListener('keydown', onKeyDown, true)
+    return () => window.removeEventListener('keydown', onKeyDown, true)
+  }, [])
+
   return (
-    <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && close()}>
-      <div className={wide ? 'dialog dialog-wide' : 'dialog'}>
+    <div className="modal-backdrop">
+      <div className={wide ? 'dialog dialog-wide' : 'dialog'} role="dialog" aria-modal="true" aria-labelledby="dialog-title">
         <div className="dialog-head">
-          <h2>{title}</h2>
-          <button onClick={close} aria-label="Close dialog"><X size={18} /></button>
+          <h2 id="dialog-title">{title}</h2>
+          <button type="button" onClick={close} aria-label="Close dialog"><X size={18} /></button>
         </div>
         {children}
       </div>
@@ -711,6 +737,15 @@ const navSections = [
     ],
   },
   {
+    title: 'Accounting',
+    items: [
+      ['purchases', 'Purchases', ShoppingCart],
+      ['journals', 'Journals', ScrollText],
+      ['ledger', 'Ledger', BookMarked],
+      ['cashbook', 'Cash book', Wallet],
+    ],
+  },
+  {
     title: 'Reports',
     items: [
       ['pnl', 'P&L', BarChart3],
@@ -725,29 +760,76 @@ const navSections = [
   },
 ] as const
 
-function Sidebar({ active, setActive, logout, company }: { active: PageKey; setActive: (x: PageKey) => void; logout: () => void; company: CompanySettings }) {
+const COLLAPSIBLE_NAV = new Set(['Operations', 'Accounting', 'Reports'])
+const NAV_COLLAPSE_KEY = 'pyramid-nav-collapsed'
+
+function Sidebar({ active, onNavigate, logout, company }: { active: PageKey; onNavigate: () => void; logout: () => void; company: CompanySettings }) {
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => {
+    if (typeof window === 'undefined') return {}
+    try {
+      return JSON.parse(localStorage.getItem(NAV_COLLAPSE_KEY) || '{}') as Record<string, boolean>
+    } catch {
+      return {}
+    }
+  })
+
+  useEffect(() => {
+    const openTitle = navSections.find(section => section.items.some(([key]) => key === active))?.title
+    if (!openTitle || !COLLAPSIBLE_NAV.has(openTitle)) return
+    setCollapsed(prev => {
+      if (!prev[openTitle]) return prev
+      const next = { ...prev, [openTitle]: false }
+      localStorage.setItem(NAV_COLLAPSE_KEY, JSON.stringify(next))
+      return next
+    })
+  }, [active])
+
+  const toggleSection = (title: string) => {
+    setCollapsed(prev => {
+      const next = { ...prev, [title]: !prev[title] }
+      localStorage.setItem(NAV_COLLAPSE_KEY, JSON.stringify(next))
+      return next
+    })
+  }
+
   return (
     <aside className="sidebar">
       <div className="sidebar-top">
-        <div className={`app-logo${company.logo ? ' app-logo-with-img' : ''}`}>
+        <Link href={PAGE_PATH.dashboard} className={`app-logo${company.logo ? ' app-logo-with-img' : ''}`} onClick={onNavigate} aria-label="Dashboard">
           {company.logo ? (
             <img className="app-logo-img" src={company.logo} alt={company.name || 'Restaurant logo'} />
           ) : (
             <span className="logo-icon"><Store size={19} /></span>
           )}
-        </div>
+        </Link>
       </div>
       <nav>
-        {navSections.map(section => (
-          <div key={section.title} className="nav-group">
-            <p>{section.title}</p>
-            {section.items.map(([key, label, Icon]) => (
-              <button key={key} className={`nav-item ${active === key ? 'active' : ''}`} onClick={() => setActive(key)}>
-                <Icon size={18} /><span>{label}</span>
-              </button>
-            ))}
-          </div>
-        ))}
+        {navSections.map(section => {
+          const collapsible = COLLAPSIBLE_NAV.has(section.title)
+          const isOpen = !collapsed[section.title]
+          return (
+            <div key={section.title} className={`nav-group${collapsible && !isOpen ? ' collapsed' : ''}`}>
+              {collapsible ? (
+                <button
+                  type="button"
+                  className={`nav-group-toggle${isOpen ? ' open' : ''}`}
+                  aria-expanded={isOpen}
+                  onClick={() => toggleSection(section.title)}
+                >
+                  <span>{section.title}</span>
+                  <ChevronRight size={14} />
+                </button>
+              ) : (
+                <p>{section.title}</p>
+              )}
+              {(!collapsible || isOpen) && section.items.map(([key, label, Icon]) => (
+                <Link key={key} href={PAGE_PATH[key]} className={`nav-item ${active === key ? 'active' : ''}`} onClick={onNavigate}>
+                  <Icon size={18} /><span>{label}</span>
+                </Link>
+              ))}
+            </div>
+          )
+        })}
       </nav>
       <div className="sidebar-bottom">
         <div className="user-chip">
@@ -760,20 +842,21 @@ function Sidebar({ active, setActive, logout, company }: { active: PageKey; setA
     </aside>
   )
 }
-function Header({ active, mobileMenu }: { active: PageKey; mobileMenu: () => void }) { const titles: Record<PageKey, [string, string]> = { dashboard: ['Dashboard', 'Live service, menu margins, and spend at a glance.'], menu: ['Menu item', 'Add and manage dishes on your menu.'], categories: ['Category', 'Name and describe the groups on your menu.'], tables: ['Tables', 'Add dining tables and seating capacity for this restaurant.'], orders: ['Orders', 'Tickets with menu items, add-ons, table, and status.'], expenses: ['Expenses', 'Track the cost of doing good work.'], pnl: ['P&L', 'Mauritian profit and loss statement from orders and expenses.'], sales: ['Sales report', 'Filter and review every sale, item, and ticket.'], 'expense-report': ['Expense report', 'Filter and review every expense, category, and line item.'], 'inventory-report': ['Inventory report', 'Items sold from completed orders, with date and category filters.'], settings: ['Settings', 'Make Pyramid Snack work your way.'] }; return <header className="topbar"><button className="mobile-menu" onClick={mobileMenu}><MenuIcon size={21} /></button><div><h1>{titles[active][0]}</h1><p>{titles[active][1]}</p></div></header> }
+function Header({ active, mobileMenu }: { active: PageKey; mobileMenu: () => void }) { return <header className="topbar"><button className="mobile-menu" onClick={mobileMenu}><MenuIcon size={21} /></button><div><h1>{PAGE_TITLES[active][0]}</h1><p>{PAGE_TITLES[active][1]}</p></div></header> }
 
-function Dashboard({ orders, expenses }: { orders: Order[]; expenses: Expense[] }) {
+function Dashboard({ orders, expenses, purchaseAmounts = [], vatOn = false }: { orders: Order[]; expenses: Expense[]; purchaseAmounts?: { date: string; amount: number }[]; vatOn?: boolean }) {
   const now = new Date()
   const year = now.getFullYear()
   const month = now.getMonth()
+  const sumPurchases = (list: { date: string; amount: number }[]) => list.reduce((sum, row) => sum + row.amount, 0)
 
   const salesOverall = sumOrders(orders)
   const salesYear = sumOrders(orders.filter(o => inYearMonth(o.date, year)))
   const salesMonth = sumOrders(orders.filter(o => inYearMonth(o.date, year, month)))
 
-  const expenseOverall = sumExpenses(expenses)
-  const expenseYear = sumExpenses(expenses.filter(e => inYearMonth(e.date, year)))
-  const expenseMonth = sumExpenses(expenses.filter(e => inYearMonth(e.date, year, month)))
+  const expenseOverall = sumExpenses(expenses, vatOn) + sumPurchases(purchaseAmounts)
+  const expenseYear = sumExpenses(expenses.filter(e => inYearMonth(e.date, year)), vatOn) + sumPurchases(purchaseAmounts.filter(row => inYearMonth(row.date, year)))
+  const expenseMonth = sumExpenses(expenses.filter(e => inYearMonth(e.date, year, month)), vatOn) + sumPurchases(purchaseAmounts.filter(row => inYearMonth(row.date, year, month)))
 
   const profitOverall = salesOverall - expenseOverall
   const profitYear = salesYear - expenseYear
@@ -1262,6 +1345,7 @@ function Orders({
   company,
   toast,
   tenantId,
+  onPosted,
 }: {
   orders: Order[]
   setOrders: React.Dispatch<React.SetStateAction<Order[]>>
@@ -1269,6 +1353,7 @@ function Orders({
   company: CompanySettings
   toast: (x: string) => void
   tenantId: string | null
+  onPosted?: (order: Order) => Promise<void>
 }) {
   const [editing, setEditing] = useState<Order | null>(null)
   const [pendingDelete, setPendingDelete] = useState<Order | null>(null)
@@ -1288,6 +1373,7 @@ function Orders({
     clientName: '',
     tableNumber: 1,
     status: 'New',
+    paymentMethod: 'cash',
     lines: [blankLine()],
     total: 0,
     time: new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
@@ -1312,6 +1398,7 @@ function Orders({
     try {
       if (tenantId) await api.deleteOrder(tenantId, pendingDelete.id)
       setOrders(xs => xs.filter(x => x.id !== pendingDelete.id))
+      await onPosted?.({ ...pendingDelete, status: 'Cancelled' })
       setPendingDelete(null)
       setEditing(null)
       toast('Order deleted')
@@ -1382,6 +1469,7 @@ function Orders({
       clientName: String(d.get('clientName')).trim() || 'Walk-in guest',
       tableNumber: Number(d.get('tableNumber')) || 1,
       status: d.get('status') as OrderStatus,
+      paymentMethod: (String(d.get('paymentMethod') || 'cash') as PayMethod),
       lines,
       total: lines.reduce((sum, line) => sum + orderLineTotal(line), 0),
       time: editing.time || new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
@@ -1390,6 +1478,7 @@ function Orders({
     try {
       const order = tenantId ? await api.saveOrder(tenantId, draft) : draft
       setOrders(xs => (editing.id ? xs.map(x => (x.id === editing.id ? order : x)) : [order, ...xs]))
+      await onPosted?.(order)
       setEditing(null)
       toast(editing.id ? 'Order updated' : 'New order created')
     } catch (err) {
@@ -1400,7 +1489,9 @@ function Orders({
   const setStatus = async (id: string, status: OrderStatus) => {
     try {
       if (tenantId) await api.updateOrderStatus(tenantId, id, status)
+      const next = orders.find(x => x.id === id)
       setOrders(xs => xs.map(x => (x.id === id ? { ...x, status } : x)))
+      if (next) await onPosted?.({ ...next, status })
       toast(`${id} marked ${status.toLowerCase()}`)
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not update status')
@@ -1441,6 +1532,7 @@ function Orders({
                 <th>Table</th>
                 <th>Items</th>
                 <th>Status</th>
+                <th>Paid by</th>
                 <th className="align-right">Total{company.vatRegistered ? ' · VAT incl.' : ''}</th>
                 <th />
               </tr>
@@ -1481,6 +1573,7 @@ function Orders({
                       </button>
                     </div>
                   </td>
+                  <td className="muted">{order.paymentMethod || 'cash'}</td>
                   <td className="align-right"><strong>{money(order.total)}</strong></td>
                   <td>
                     <div className="row-actions">
@@ -1490,7 +1583,7 @@ function Orders({
                   </td>
                 </tr>
               ))}
-              {!shown.length && <tr><td colSpan={7} className="muted">No orders yet.</td></tr>}
+              {!shown.length && <tr><td colSpan={8} className="muted">No orders yet.</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1510,6 +1603,12 @@ function Orders({
               </label>
               <label>Client name<input name="clientName" value={editing.clientName} onChange={e => setEditing({ ...editing, clientName: e.target.value })} placeholder="Walk-in guest" /></label>
               <label>Table number<input name="tableNumber" type="number" min={1} value={editing.tableNumber} onChange={e => setEditing({ ...editing, tableNumber: Number(e.target.value) })} required /></label>
+              <label>Paid by
+                <select name="paymentMethod" value={editing.paymentMethod === 'bank' ? 'bank' : 'cash'} onChange={e => setEditing({ ...editing, paymentMethod: e.target.value as PayMethod })}>
+                  <option value="cash">Cash</option>
+                  <option value="bank">Bank</option>
+                </select>
+              </label>
               <div className="line-items full-span">
                 <div className="line-items-head">
                   <strong>Menu items</strong>
@@ -1581,14 +1680,15 @@ function Orders({
   )
 }
 
-function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCategoryMap }: { expenses: Expense[]; setExpenses: React.Dispatch<React.SetStateAction<Expense[]>>; company: CompanySettings; toast: (x: string) => void; tenantId: string | null; expenseCategoryMap: Map<string, string> }) {
+function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCategoryMap, onPosted }: { expenses: Expense[]; setExpenses: React.Dispatch<React.SetStateAction<Expense[]>>; company: CompanySettings; toast: (x: string) => void; tenantId: string | null; expenseCategoryMap: Map<string, string>; onPosted?: (expense: Expense | null, id?: string) => Promise<void> }) {
   const [editing, setEditing] = useState<Expense | null>(null)
   const [pendingDelete, setPendingDelete] = useState<Expense | null>(null)
   const [query, setQuery] = useState('')
   const now = new Date()
   const year = now.getFullYear()
   const month = now.getMonth()
-  const totalOf = (list: Expense[]) => list.reduce((sum, e) => sum + expenseTotal(e), 0)
+  const vatOn = Boolean(company.vatRegistered)
+  const totalOf = (list: Expense[]) => list.reduce((sum, e) => sum + expenseSpend(e, vatOn), 0)
   const inYear = (e: Expense) => {
     const d = new Date(`${e.date}T00:00:00`)
     return !Number.isNaN(d.getTime()) && d.getFullYear() === year
@@ -1610,6 +1710,8 @@ function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCate
     id: '',
     date: new Date().toISOString().slice(0, 10),
     category: 'Produce',
+    vatInclusive: true,
+    vatClaimable: vatOn,
     lines: [{ id: newId(), description: '', qty: 1, amount: 0 }],
   })
   const confirmDelete = async () => {
@@ -1617,6 +1719,7 @@ function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCate
     try {
       if (tenantId) await api.deleteExpense(tenantId, pendingDelete.id)
       setExpenses(xs => xs.filter(x => x.id !== pendingDelete.id))
+      await onPosted?.(null, pendingDelete.id)
       setPendingDelete(null)
       setEditing(null)
       toast('Expense deleted')
@@ -1649,6 +1752,8 @@ function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCate
       id: editing.id || '',
       date: String(d.get('date')),
       category: String(d.get('category')).trim(),
+      vatInclusive: editing.vatInclusive !== false,
+      vatClaimable: editing.vatClaimable !== false,
       lines,
     }
     try {
@@ -1661,6 +1766,7 @@ function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCate
         expense = { ...draft, id: draft.id || newId() }
       }
       setExpenses(xs => editing.id ? xs.map(x => x.id === editing.id ? expense : x) : [expense, ...xs])
+      await onPosted?.(expense)
       setEditing(null)
       toast(editing.id ? 'Expense updated' : 'Expense added')
     } catch (err) {
@@ -1695,8 +1801,17 @@ function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCate
                       ))}
                     </div>
                   </td>
-                  <td className="align-right"><strong>{money(expenseTotal(x))}</strong></td>
-                  <td><div className="row-actions"><button className="more-button" onClick={() => setEditing({ ...x, lines: x.lines.map(l => ({ ...l })) })} aria-label={`Edit ${x.category} expense`}><MoreHorizontal size={18} /></button><button className="more-button" onClick={() => setPendingDelete(x)} aria-label={`Delete ${x.category} expense`}><Trash2 size={16} /></button></div></td>
+                  <td className="align-right">
+                    <strong>{money(expenseSpend(x, vatOn))}</strong>
+                    {vatOn && (
+                      <span className="vat-flag">
+                        {x.vatInclusive !== false ? 'VAT incl.' : 'excl. VAT'}
+                        {' · '}
+                        {x.vatClaimable !== false ? 'claimable' : 'not claimable'}
+                      </span>
+                    )}
+                  </td>
+                  <td><div className="row-actions"><button className="more-button" onClick={() => setEditing({ ...x, vatInclusive: x.vatInclusive !== false, vatClaimable: x.vatClaimable !== false, lines: x.lines.map(l => ({ ...l })) })} aria-label={`Edit ${x.category} expense`}><MoreHorizontal size={18} /></button><button className="more-button" onClick={() => setPendingDelete(x)} aria-label={`Delete ${x.category} expense`}><Trash2 size={16} /></button></div></td>
                 </tr>
               ))}
               {!shown.length && <tr><td colSpan={5} className="muted">No expenses yet.</td></tr>}
@@ -1718,6 +1833,13 @@ function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCate
                   {expenseCategories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
                 </select>
               </label>
+              {vatOn && (
+                <VatToggleRow
+                  vatInclusive={editing.vatInclusive !== false}
+                  vatClaimable={editing.vatClaimable !== false}
+                  onChange={patch => setEditing({ ...editing, ...patch })}
+                />
+              )}
               <div className="line-items full-span">
                 <div className="line-items-head">
                   <strong>Line items</strong>
@@ -1727,11 +1849,12 @@ function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCate
                   <div className="line-item-row" key={line.id}>
                     <label>Description<input value={line.description} onChange={e => updateLine(line.id, { description: e.target.value })} placeholder={`Item ${index + 1}`} required /></label>
                     <label>Qty<input type="number" min={0} step="1" value={line.qty} onChange={e => updateLine(line.id, { qty: Number(e.target.value) })} required /></label>
-                    <label>Amount{company.vatRegistered ? <span className="field-hint">VAT incl.</span> : null}<input type="number" min={0} step="0.01" value={line.amount} onChange={e => updateLine(line.id, { amount: Number(e.target.value) })} required /></label>
+                    <label>Amount{vatOn ? <span className="field-hint">{editing.vatInclusive !== false ? 'VAT incl.' : 'excl. VAT'}</span> : null}<input type="number" min={0} step="0.01" value={line.amount} onChange={e => updateLine(line.id, { amount: Number(e.target.value) })} required /></label>
                     <button type="button" className="more-button" onClick={() => removeLine(line.id)} aria-label="Remove line" disabled={editing.lines.length <= 1}><Trash2 size={16} /></button>
                   </div>
                 ))}
-                <div className="line-items-total"><span className="muted">Total</span><strong>{money(expenseTotal(editing))}</strong></div>
+                <div className="line-items-total"><span className="muted">{vatOn && editing.vatInclusive === false ? 'Entered excl. VAT' : 'Total'}</span><strong>{money(expenseTotal(editing))}</strong></div>
+                <VatBreakdown entered={expenseTotal(editing)} vatInclusive={editing.vatInclusive !== false} vatClaimable={editing.vatClaimable !== false} vatOn={vatOn} />
               </div>
             </div>
             <FormActions close={() => setEditing(null)} onDelete={editing.id ? () => setPendingDelete(editing) : undefined} />
@@ -2121,6 +2244,7 @@ function ExpenseReport({ expenses, company, toast }: { expenses: Expense[]; comp
   const [query, setQuery] = useState('')
   const [view, setView] = useState<'expenses' | 'categories' | 'lines'>('expenses')
   const [downloading, setDownloading] = useState(false)
+  const vatOn = Boolean(company.vatRegistered)
 
   const categoryOptions = Array.from(
     new Set([
@@ -2151,14 +2275,14 @@ function ExpenseReport({ expenses, company, toast }: { expenses: Expense[]; comp
     })
     .sort((a, b) => (a.date === b.date ? b.id.localeCompare(a.id) : b.date.localeCompare(a.date)))
 
-  const spendTotal = filtered.reduce((sum, e) => sum + expenseTotal(e), 0)
+  const spendTotal = filtered.reduce((sum, e) => sum + expenseSpend(e, vatOn), 0)
   const avgExpense = filtered.length ? spendTotal / filtered.length : 0
   const lineCount = filtered.reduce((sum, e) => sum + e.lines.length, 0)
   const qtyCount = filtered.reduce((sum, e) => sum + e.lines.reduce((s, l) => s + (Number(l.qty) || 0), 0), 0)
 
   const bucketTotals = filtered.reduce<Record<ExpenseBucket, number>>((acc, e) => {
     const bucket = expenseBucket(e.category)
-    acc[bucket] += expenseTotal(e)
+    acc[bucket] += expenseSpend(e, vatOn)
     return acc
   }, { cogs: 0, distribution: 0, admin: 0, other: 0 })
 
@@ -2166,7 +2290,7 @@ function ExpenseReport({ expenses, company, toast }: { expenses: Expense[]; comp
     const name = expense.category.trim() || 'Uncategorised'
     if (!acc[name]) acc[name] = { count: 0, amount: 0 }
     acc[name].count += 1
-    acc[name].amount += expenseTotal(expense)
+    acc[name].amount += expenseSpend(expense, vatOn)
     return acc
   }, {})
   const categoryRows = Object.entries(categoryBreakdown)
@@ -2236,7 +2360,7 @@ function ExpenseReport({ expenses, company, toast }: { expenses: Expense[]; comp
         period: rangeLabel,
         filename: reportFileName('expense-report'),
         kpis: [
-          { label: company.vatRegistered ? 'Total spend (VAT incl.)' : 'Total spend', value: money(spendTotal) },
+          { label: 'Total spend', value: money(spendTotal) },
           { label: 'Expenses', value: String(filtered.length) },
           { label: 'Avg expense', value: money(avgExpense) },
           { label: 'Line items', value: String(lineCount) },
@@ -2252,7 +2376,7 @@ function ExpenseReport({ expenses, company, toast }: { expenses: Expense[]; comp
               expense.category || 'Uncategorised',
               expenseBucketLabel[expenseBucket(expense.category)],
               expense.lines.map(line => `${line.description || 'Untitled'} · ${line.qty} × ${money(line.amount)}`).join(', '),
-              money(expenseTotal(expense)),
+              money(expenseSpend(expense, vatOn)),
             ]),
           },
           {
@@ -2282,7 +2406,7 @@ function ExpenseReport({ expenses, company, toast }: { expenses: Expense[]; comp
         notes: [
           'Totals use the filters currently applied on screen.',
           `Buckets: COGS ${money(bucketTotals.cogs)} · Distribution ${money(bucketTotals.distribution)} · Overhead ${money(bucketTotals.admin + bucketTotals.other)}.`,
-          company.vatRegistered ? 'Amounts are VAT inclusive.' : 'The company is not VAT registered.',
+          company.vatRegistered ? 'Cash paid after each bill’s VAT inclusive/exclusive setting.' : 'The company is not VAT registered.',
         ],
       })
       toast('Expense report PDF downloaded')
@@ -2333,7 +2457,7 @@ function ExpenseReport({ expenses, company, toast }: { expenses: Expense[]; comp
 
       <div className="sales-summary">
         <div className="sales-kpi">
-          <span>Total spend{company.vatRegistered ? ' · VAT incl.' : ''}</span>
+          <span>Total spend</span>
           <strong>{money(spendTotal)}</strong>
         </div>
         <div className="sales-kpi">
@@ -2398,7 +2522,7 @@ function ExpenseReport({ expenses, company, toast }: { expenses: Expense[]; comp
                         </span>
                       </div>
                     </td>
-                    <td className="align-right"><strong>{money(expenseTotal(expense))}</strong></td>
+                    <td className="align-right"><strong>{money(expenseSpend(expense, vatOn))}</strong></td>
                   </tr>
                 ))}
                 {!filtered.length && <tr><td colSpan={5} className="muted">No expenses match these filters.</td></tr>}
@@ -2850,7 +2974,7 @@ function InventoryReport({ orders, menu, company, toast }: { orders: Order[]; me
   )
 }
 
-function Reports({ orders, expenses, company, toast }: { orders: Order[]; expenses: Expense[]; company: CompanySettings; toast: (x: string) => void }) {
+function Reports({ orders, expenses, purchases = [], company, toast }: { orders: Order[]; expenses: Expense[]; purchases?: Purchase[]; company: CompanySettings; toast: (x: string) => void }) {
   const now = new Date()
   const year = now.getFullYear()
   const month = now.getMonth()
@@ -2858,6 +2982,14 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
   const [period, setPeriod] = useState<PeriodKey>('year')
   const [downloading, setDownloading] = useState(false)
   const vatOn = company.vatRegistered
+  type PnlParts = { exclusive: number; vat: number; inclusive: number }
+  const emptyPnl = (): PnlParts => ({ exclusive: 0, vat: 0, inclusive: 0 })
+  const addPnl = (a: PnlParts, b: PnlParts): PnlParts => ({ exclusive: a.exclusive + b.exclusive, vat: a.vat + b.vat, inclusive: a.inclusive + b.inclusive })
+  const negPnl = (p: PnlParts): PnlParts => ({ exclusive: -p.exclusive, vat: -p.vat, inclusive: -p.inclusive })
+  const salesPnl = (inclusive: number): PnlParts => {
+    const parts = vatSplit(inclusive, vatOn)
+    return { exclusive: parts.exclusive, vat: parts.vat, inclusive: parts.inclusive }
+  }
 
   const inPeriod = (iso: string) => {
     if (period === 'overall') return true
@@ -2865,52 +2997,53 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
     return inYearMonth(iso, year, month)
   }
 
-  const periodOrders = orders.filter(o => inPeriod(o.date) && o.status !== 'Cancelled')
+  const periodOrders = orders.filter(o => inPeriod(o.date) && o.status === 'Completed')
   const periodExpenses = expenses.filter(e => inPeriod(e.date))
+  const periodPurchases = purchases.filter(p => inPeriod(p.date))
 
-  const revenueIncl = sumOrders(periodOrders)
-  const expensesByCategory = periodExpenses.reduce<Record<string, number>>((acc, e) => {
-    acc[e.category] = (acc[e.category] || 0) + expenseTotal(e)
+  const revenue = salesPnl(sumOrders(periodOrders))
+  const expensesByCategory = periodExpenses.reduce<Record<string, PnlParts>>((acc, e) => {
+    acc[e.category] = addPnl(acc[e.category] || emptyPnl(), expensePnl(e, vatOn))
     return acc
   }, {})
+  const purchaseCogs = periodPurchases.reduce((sum, purchase) => addPnl(sum, purchasePnl(purchase, vatOn)), emptyPnl())
 
-  const costOfSalesIncl = Object.entries(expensesByCategory)
+  const costOfSales = Object.entries(expensesByCategory)
     .filter(([cat]) => cogsExpenseCategories.has(cat))
-    .reduce((sum, [, amount]) => sum + amount, 0)
+    .reduce((sum, [, parts]) => addPnl(sum, parts), purchaseCogs)
 
-  const distributionCostsIncl = Object.entries(expensesByCategory)
+  const distributionCosts = Object.entries(expensesByCategory)
     .filter(([cat]) => distributionExpenseCategories.has(cat))
-    .reduce((sum, [, amount]) => sum + amount, 0)
+    .reduce((sum, [, parts]) => addPnl(sum, parts), emptyPnl())
 
-  const administrativeExpensesIncl = Object.entries(expensesByCategory)
+  const administrativeExpenses = Object.entries(expensesByCategory)
     .filter(([cat]) => adminExpenseCategories.has(cat))
-    .reduce((sum, [, amount]) => sum + amount, 0)
+    .reduce((sum, [, parts]) => addPnl(sum, parts), emptyPnl())
 
-  const otherExpensesIncl = Object.entries(expensesByCategory)
+  const otherExpenses = Object.entries(expensesByCategory)
     .filter(([cat]) => !cogsExpenseCategories.has(cat) && !distributionExpenseCategories.has(cat) && !adminExpenseCategories.has(cat))
-    .reduce((sum, [, amount]) => sum + amount, 0)
+    .reduce((sum, [, parts]) => addPnl(sum, parts), emptyPnl())
 
-  const revenueExcl = excl(revenueIncl, vatOn)
-  const costOfSalesExcl = excl(costOfSalesIncl, vatOn)
-  const distributionExcl = excl(distributionCostsIncl, vatOn)
-  const adminExcl = excl(administrativeExpensesIncl, vatOn)
-  const otherExcl = excl(otherExpensesIncl, vatOn)
-
-  const grossProfitIncl = revenueIncl - costOfSalesIncl
-  const grossProfitExcl = revenueExcl - costOfSalesExcl
-  const operatingProfitIncl = grossProfitIncl - distributionCostsIncl - administrativeExpensesIncl - otherExpensesIncl
-  const operatingProfitExcl = grossProfitExcl - distributionExcl - adminExcl - otherExcl
-  const financeCosts = 0
-  const profitBeforeTaxIncl = operatingProfitIncl - financeCosts
-  const profitBeforeTaxExcl = operatingProfitExcl - financeCosts
-  // Corporate tax is charged on accounting profit exclusive of VAT
-  const incomeTaxExpense = profitBeforeTaxExcl > 0 ? profitBeforeTaxExcl * CORPORATE_TAX_RATE : 0
-  const profitForPeriodExcl = profitBeforeTaxExcl - incomeTaxExpense
-  const profitForPeriodIncl = profitBeforeTaxIncl - incomeTaxExpense
-
-  const outputVat = vatSplit(revenueIncl, vatOn).vat
-  const inputVat = vatSplit(costOfSalesIncl + distributionCostsIncl + administrativeExpensesIncl + otherExpensesIncl, vatOn).vat
-  const netVat = outputVat - inputVat
+  const grossProfit: PnlParts = {
+    exclusive: revenue.exclusive - costOfSales.exclusive,
+    vat: revenue.vat - costOfSales.vat,
+    inclusive: revenue.inclusive - costOfSales.inclusive,
+  }
+  const operatingProfit: PnlParts = {
+    exclusive: grossProfit.exclusive - distributionCosts.exclusive - administrativeExpenses.exclusive - otherExpenses.exclusive,
+    vat: grossProfit.vat - distributionCosts.vat - administrativeExpenses.vat - otherExpenses.vat,
+    inclusive: grossProfit.inclusive - distributionCosts.inclusive - administrativeExpenses.inclusive - otherExpenses.inclusive,
+  }
+  const financeCosts = emptyPnl()
+  const profitBeforeTax: PnlParts = {
+    exclusive: operatingProfit.exclusive - financeCosts.exclusive,
+    vat: operatingProfit.vat - financeCosts.vat,
+    inclusive: operatingProfit.inclusive - financeCosts.inclusive,
+  }
+  const incomeTaxExpense = profitBeforeTax.exclusive > 0 ? profitBeforeTax.exclusive * CORPORATE_TAX_RATE : 0
+  const profitForPeriodExcl = profitBeforeTax.exclusive - incomeTaxExpense
+  const profitForPeriodIncl = profitBeforeTax.inclusive - incomeTaxExpense
+  const netVat = revenue.vat - (costOfSales.vat + distributionCosts.vat + administrativeExpenses.vat + otherExpenses.vat)
 
   const periodLabel =
     period === 'month'
@@ -2919,85 +3052,84 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
         ? `Year ended 31 December ${year}`
         : 'All periods'
 
-  const cogsLines = Object.entries(expensesByCategory)
-    .filter(([cat]) => cogsExpenseCategories.has(cat))
-    .sort((a, b) => b[1] - a[1])
+  const cogsLines = [
+    ...Object.entries(expensesByCategory)
+      .filter(([cat]) => cogsExpenseCategories.has(cat))
+      .sort((a, b) => b[1].inclusive - a[1].inclusive),
+    ...(purchaseCogs.inclusive ? [['Purchases of goods', purchaseCogs] as const] : []),
+  ]
   const adminLines = Object.entries(expensesByCategory)
     .filter(([cat]) => adminExpenseCategories.has(cat))
-    .sort((a, b) => b[1] - a[1])
+    .sort((a, b) => b[1].inclusive - a[1].inclusive)
   const distributionLines = Object.entries(expensesByCategory)
     .filter(([cat]) => distributionExpenseCategories.has(cat))
-    .sort((a, b) => b[1] - a[1])
+    .sort((a, b) => b[1].inclusive - a[1].inclusive)
   const otherLines = Object.entries(expensesByCategory)
     .filter(([cat]) => !cogsExpenseCategories.has(cat) && !distributionExpenseCategories.has(cat) && !adminExpenseCategories.has(cat))
-    .sort((a, b) => b[1] - a[1])
+    .sort((a, b) => b[1].inclusive - a[1].inclusive)
 
   const row = (
     label: string,
-    inclusiveAmount: number,
-    opts?: { bold?: boolean; total?: boolean; muted?: boolean; indent?: boolean; noVat?: boolean }
+    parts: PnlParts,
+    opts?: { key?: string; bold?: boolean; total?: boolean; muted?: boolean; indent?: boolean; noVat?: boolean }
   ) => {
-    const parts = opts?.noVat
-      ? { exclusive: inclusiveAmount, vat: 0, inclusive: inclusiveAmount }
-      : vatSplit(inclusiveAmount, vatOn)
+    const shown = opts?.noVat ? { exclusive: parts.inclusive, vat: 0, inclusive: parts.inclusive } : parts
     return (
-      <tr className={`${opts?.total ? 'pnl-total' : ''} ${opts?.bold ? 'pnl-bold' : ''}`}>
+      <tr key={opts?.key ?? label} className={`${opts?.total ? 'pnl-total' : ''} ${opts?.bold ? 'pnl-bold' : ''}`}>
         <td className={opts?.indent ? 'pnl-indent' : ''}>{label}</td>
         {vatOn && (
           <>
-            <td className={`align-right ${opts?.muted ? 'muted' : ''} ${parts.exclusive < 0 ? 'negative' : ''}`}>{money(parts.exclusive)}</td>
-            <td className={`align-right ${opts?.muted ? 'muted' : ''} ${parts.vat < 0 ? 'negative' : ''}`}>{opts?.noVat ? '—' : money(parts.vat)}</td>
+            <td className={`align-right ${opts?.muted ? 'muted' : ''} ${shown.exclusive < 0 ? 'negative' : ''}`}>{money(shown.exclusive)}</td>
+            <td className={`align-right ${opts?.muted ? 'muted' : ''} ${shown.vat < 0 ? 'negative' : ''}`}>{opts?.noVat ? '—' : money(shown.vat)}</td>
           </>
         )}
-        <td className={`align-right ${opts?.muted ? 'muted' : ''} ${parts.inclusive < 0 ? 'negative' : ''}`}>{money(parts.inclusive)}</td>
+        <td className={`align-right ${opts?.muted ? 'muted' : ''} ${shown.inclusive < 0 ? 'negative' : ''}`}>{money(shown.inclusive)}</td>
       </tr>
     )
   }
 
   const pnlHead = vatOn ? ['Description', 'Excl. VAT', 'VAT', 'Incl. VAT'] : ['Description', 'MUR']
-  const pnlCells = (inclusiveAmount: number, opts?: { noVat?: boolean }) => {
-    const parts = opts?.noVat
-      ? { exclusive: inclusiveAmount, vat: 0, inclusive: inclusiveAmount }
-      : vatSplit(inclusiveAmount, vatOn)
+  const pnlCells = (parts: PnlParts, opts?: { noVat?: boolean }) => {
+    const shown = opts?.noVat ? { exclusive: parts.inclusive, vat: 0, inclusive: parts.inclusive } : parts
     return vatOn
-      ? [money(parts.exclusive), opts?.noVat ? '-' : money(parts.vat), money(parts.inclusive)]
-      : [money(parts.inclusive)]
+      ? [money(shown.exclusive), opts?.noVat ? '-' : money(shown.vat), money(shown.inclusive)]
+      : [money(shown.inclusive)]
   }
-  const pnlRow = (label: string, inclusiveAmount: number, opts?: { indent?: boolean; noVat?: boolean }) => [
+  const pnlRow = (label: string, parts: PnlParts, opts?: { indent?: boolean; noVat?: boolean }) => [
     opts?.indent ? `    ${label}` : label,
-    ...pnlCells(inclusiveAmount, opts),
+    ...pnlCells(parts, opts),
   ]
 
   const downloadPdf = async () => {
     setDownloading(true)
     try {
       const pnlBody = [
-        pnlRow('Revenue (from restaurant orders)', revenueIncl),
-        pnlRow('Cost of sales', -costOfSalesIncl),
-        ...(cogsLines.length ? cogsLines.map(([cat, amount]) => pnlRow(cat, -amount, { indent: true })) : [pnlRow('No cost-of-sales purchases recorded in period', 0, { indent: true })]),
-        pnlRow('Gross profit', grossProfitIncl),
-        pnlRow('Distribution costs', -distributionCostsIncl),
-        ...(distributionLines.length ? distributionLines.map(([cat, amount]) => pnlRow(cat, -amount, { indent: true })) : [pnlRow('Nil', 0, { indent: true })]),
-        pnlRow('Administrative expenses', -administrativeExpensesIncl),
-        ...(adminLines.length ? adminLines.map(([cat, amount]) => pnlRow(cat, -amount, { indent: true })) : [pnlRow('Nil', 0, { indent: true })]),
-        pnlRow('Other expenses', -otherExpensesIncl),
-        ...(otherLines.length ? otherLines.map(([cat, amount]) => pnlRow(cat, -amount, { indent: true })) : [pnlRow('Nil', 0, { indent: true })]),
-        pnlRow('Finance costs', -financeCosts),
-        pnlRow('Profit / (loss) before tax', profitBeforeTaxIncl),
-        pnlRow('Income tax expense (estimated at 15%)', -incomeTaxExpense, { noVat: true }),
+        pnlRow('Revenue (from restaurant orders)', revenue),
+        pnlRow('Cost of sales', negPnl(costOfSales)),
+        ...(cogsLines.length ? cogsLines.map(([cat, parts]) => pnlRow(String(cat), negPnl(parts), { indent: true })) : [pnlRow('No cost-of-sales purchases recorded in period', emptyPnl(), { indent: true })]),
+        pnlRow('Gross profit', grossProfit),
+        pnlRow('Distribution costs', negPnl(distributionCosts)),
+        ...(distributionLines.length ? distributionLines.map(([cat, parts]) => pnlRow(cat, negPnl(parts), { indent: true })) : [pnlRow('Nil', emptyPnl(), { indent: true })]),
+        pnlRow('Administrative expenses', negPnl(administrativeExpenses)),
+        ...(adminLines.length ? adminLines.map(([cat, parts]) => pnlRow(cat, negPnl(parts), { indent: true })) : [pnlRow('Nil', emptyPnl(), { indent: true })]),
+        pnlRow('Other expenses', negPnl(otherExpenses)),
+        ...(otherLines.length ? otherLines.map(([cat, parts]) => pnlRow(cat, negPnl(parts), { indent: true })) : [pnlRow('Nil', emptyPnl(), { indent: true })]),
+        pnlRow('Finance costs', financeCosts),
+        pnlRow('Profit / (loss) before tax', profitBeforeTax),
+        pnlRow('Income tax expense (estimated at 15%)', { exclusive: -incomeTaxExpense, vat: 0, inclusive: -incomeTaxExpense }, { noVat: true }),
         vatOn
           ? ['Profit / (loss) for the period', money(profitForPeriodExcl), '-', money(profitForPeriodIncl)]
-          : pnlRow('Profit / (loss) for the period', profitForPeriodIncl),
+          : pnlRow('Profit / (loss) for the period', { exclusive: profitForPeriodExcl, vat: 0, inclusive: profitForPeriodIncl }),
         ...(vatOn ? [['Net VAT position (output minus input)', '-', money(netVat), '-']] : []),
       ]
-      const denom = vatOn ? revenueExcl : revenueIncl
+      const denom = vatOn ? revenue.exclusive : revenue.inclusive
       await downloadReportPdf({
         company,
         title: 'Statement of profit or loss',
         period: periodLabel,
         filename: reportFileName('pnl-report'),
         kpis: [
-          { label: 'Gross margin', value: denom ? `${Math.round((grossProfitExcl / denom) * 100)}%` : '-' },
+          { label: 'Gross margin', value: denom ? `${Math.round((grossProfit.exclusive / denom) * 100)}%` : '-' },
           { label: 'Net margin', value: denom ? `${Math.round((profitForPeriodExcl / denom) * 100)}%` : '-' },
           { label: vatOn ? 'Net VAT' : 'Orders in period', value: vatOn ? money(netVat) : String(periodOrders.length) },
           { label: vatOn ? 'VAT incl. profit' : 'Profit for period', value: money(profitForPeriodIncl) },
@@ -3011,9 +3143,9 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
           },
         ],
         notes: [
-          `Revenue and expense totals are taken from recorded orders and expenses${vatOn ? ' on a VAT-inclusive basis' : ''} and presented in MUR.`,
-          ...(vatOn ? [`VAT is extracted at the standard Mauritius rate of ${Math.round(VAT_RATE * 100)}%. Exclusive amounts drive the trading result.`] : []),
-          'Cost of sales aggregates Produce, Meat & seafood, Dairy, Dry goods, Beverages, Alcohol, and Packaging.',
+          `Revenue is taken from restaurant orders. Expenses and purchases follow each bill’s VAT inclusive/exclusive and claimable settings.`,
+          ...(vatOn ? [`VAT is calculated at the standard Mauritius rate of ${Math.round(VAT_RATE * 100)}%. Only claimable input VAT is stripped from the trading result.`] : []),
+          'Cost of sales aggregates purchases of goods plus Produce, Meat & seafood, Dairy, Dry goods, Beverages, Alcohol, and Packaging.',
           'Operating expenses are classified by function (distribution, administrative, and other).',
           `Income tax is an illustrative charge at 15% on profit before tax${vatOn ? ' exclusive of VAT' : ''}. This is not an MRA return.`,
           `This statement is a management report for ${company.name || 'Pyramid Snack'} and should be reviewed before statutory filing.`,
@@ -3054,7 +3186,7 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
                 {company.brn && <>BRN {company.brn}</>}
                 {company.brn && company.vatRegistered && company.vatNumber ? ' · ' : ''}
                 {company.vatRegistered && company.vatNumber && <>VAT {company.vatNumber}</>}
-                {company.vatRegistered ? <> · Prices are VAT inclusive at {Math.round(VAT_RATE * 100)}%</> : <> · Not VAT registered</>}
+                {company.vatRegistered ? <> · VAT at {Math.round(VAT_RATE * 100)}% · expenses and purchases set as inclusive/exclusive per bill</> : <> · Not VAT registered</>}
               </p>
             </div>
           </div>
@@ -3076,27 +3208,27 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
               </tr>
             </thead>
             <tbody>
-              {row('Revenue (from restaurant orders)', revenueIncl, { bold: true })}
-              {row('Cost of sales', -costOfSalesIncl, { bold: true })}
-              {cogsLines.map(([cat, amount]) => row(cat, -amount, { indent: true, muted: true }))}
-              {!cogsLines.length && row('No cost-of-sales purchases recorded in period', 0, { indent: true, muted: true })}
-              {row('Gross profit', grossProfitIncl, { total: true, bold: true })}
+              {row('Revenue (from restaurant orders)', revenue, { bold: true })}
+              {row('Cost of sales', negPnl(costOfSales), { bold: true })}
+              {cogsLines.map(([cat, parts]) => row(String(cat), negPnl(parts), { key: `cogs-${cat}`, indent: true, muted: true }))}
+              {!cogsLines.length && row('No cost-of-sales purchases recorded in period', emptyPnl(), { key: 'cogs-empty', indent: true, muted: true })}
+              {row('Gross profit', grossProfit, { total: true, bold: true })}
 
-              {row('Distribution costs', -distributionCostsIncl, { bold: true })}
-              {distributionLines.map(([cat, amount]) => row(cat, -amount, { indent: true, muted: true }))}
-              {!distributionLines.length && row('Nil', 0, { indent: true, muted: true })}
+              {row('Distribution costs', negPnl(distributionCosts), { bold: true })}
+              {distributionLines.map(([cat, parts]) => row(cat, negPnl(parts), { key: `dist-${cat}`, indent: true, muted: true }))}
+              {!distributionLines.length && row('Nil', emptyPnl(), { key: 'dist-empty', indent: true, muted: true })}
 
-              {row('Administrative expenses', -administrativeExpensesIncl, { bold: true })}
-              {adminLines.map(([cat, amount]) => row(cat, -amount, { indent: true, muted: true }))}
-              {!adminLines.length && row('Nil', 0, { indent: true, muted: true })}
+              {row('Administrative expenses', negPnl(administrativeExpenses), { bold: true })}
+              {adminLines.map(([cat, parts]) => row(cat, negPnl(parts), { key: `admin-${cat}`, indent: true, muted: true }))}
+              {!adminLines.length && row('Nil', emptyPnl(), { key: 'admin-empty', indent: true, muted: true })}
 
-              {row('Other expenses', -otherExpensesIncl, { bold: true })}
-              {otherLines.map(([cat, amount]) => row(cat, -amount, { indent: true, muted: true }))}
-              {!otherLines.length && row('Nil', 0, { indent: true, muted: true })}
+              {row('Other expenses', negPnl(otherExpenses), { bold: true })}
+              {otherLines.map(([cat, parts]) => row(cat, negPnl(parts), { key: `other-${cat}`, indent: true, muted: true }))}
+              {!otherLines.length && row('Nil', emptyPnl(), { key: 'other-empty', indent: true, muted: true })}
 
-              {row('Finance costs', -financeCosts, { bold: true })}
-              {row('Profit / (loss) before tax', profitBeforeTaxIncl, { total: true, bold: true })}
-              {row('Income tax expense (estimated at 15%)', -incomeTaxExpense, { bold: true, noVat: true })}
+              {row('Finance costs', financeCosts, { bold: true })}
+              {row('Profit / (loss) before tax', profitBeforeTax, { total: true, bold: true })}
+              {row('Income tax expense (estimated at 15%)', { exclusive: -incomeTaxExpense, vat: 0, inclusive: -incomeTaxExpense }, { bold: true, noVat: true })}
               {vatOn ? (
                 <tr className="pnl-total pnl-bold">
                   <td>Profit / (loss) for the period</td>
@@ -3104,7 +3236,7 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
                   <td className="align-right muted">—</td>
                   <td className={`align-right ${profitForPeriodIncl < 0 ? 'negative' : ''}`}>{money(profitForPeriodIncl)}</td>
                 </tr>
-              ) : row('Profit / (loss) for the period', profitForPeriodIncl, { total: true, bold: true })}
+              ) : row('Profit / (loss) for the period', { exclusive: profitForPeriodExcl, vat: 0, inclusive: profitForPeriodIncl }, { total: true, bold: true })}
               {vatOn && (
                 <tr className="pnl-bold">
                   <td>Net VAT position (output minus input)</td>
@@ -3120,9 +3252,9 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
         <div className="pnl-notes">
           <h3>Notes</h3>
           <ol>
-            <li>Revenue and expense totals are taken from recorded orders and expenses{vatOn ? ' on a VAT-inclusive basis' : ''} and presented in MUR.</li>
-            {vatOn && <li>Because the company is VAT registered, VAT is extracted at the standard Mauritius rate of {Math.round(VAT_RATE * 100)}%. Exclusive amounts drive the trading result; the VAT column shows output/input VAT embedded in inclusive prices.</li>}
-            <li>Cost of sales aggregates purchases classified as Produce, Meat &amp; seafood, Dairy, Dry goods, Beverages, Alcohol, and Packaging.</li>
+            <li>Revenue is taken from completed restaurant orders. Expenses and purchases use each bill’s VAT inclusive / exclusive and claimable flags.</li>
+            {vatOn && <li>VAT is calculated at the standard Mauritius rate of {Math.round(VAT_RATE * 100)}%. Claimable input VAT is shown in the VAT column and excluded from the trading result. Bills marked not claimable keep VAT inside the expense.</li>}
+            <li>Cost of sales aggregates purchases of goods plus Produce, Meat &amp; seafood, Dairy, Dry goods, Beverages, Alcohol, and Packaging.</li>
             <li>Operating expenses are classified by function under IFRS for SMEs (distribution, administrative, and other).</li>
             <li>Income tax is an illustrative charge at the Mauritius headline company rate of 15% on profit before tax{vatOn ? ' exclusive of VAT' : ''}. This is not an MRA return.</li>
             {vatOn && <li>Net VAT position is output VAT on sales less input VAT on recorded expenses for the period. Actual VAT return figures may differ after adjustments.</li>}
@@ -3132,8 +3264,8 @@ function Reports({ orders, expenses, company, toast }: { orders: Order[]; expens
       </Card>
 
       <div className="metric-grid expense-metrics" style={{ marginTop: 18 }}>
-        <Card className="metric-card"><p>Gross margin</p><strong>{(vatOn ? revenueExcl : revenueIncl) ? `${Math.round((grossProfitExcl / (vatOn ? revenueExcl : revenueIncl)) * 100)}%` : '—'}</strong><span className="muted">{vatOn ? 'On excl. VAT revenue' : 'Gross profit ÷ revenue'}</span></Card>
-        <Card className="metric-card"><p>Net margin</p><strong className={profitForPeriodExcl >= 0 ? 'positive' : 'negative'}>{(vatOn ? revenueExcl : revenueIncl) ? `${Math.round((profitForPeriodExcl / (vatOn ? revenueExcl : revenueIncl)) * 100)}%` : '—'}</strong><span className="muted">Profit after tax ÷ revenue</span></Card>
+        <Card className="metric-card"><p>Gross margin</p><strong>{(vatOn ? revenue.exclusive : revenue.inclusive) ? `${Math.round((grossProfit.exclusive / (vatOn ? revenue.exclusive : revenue.inclusive)) * 100)}%` : '—'}</strong><span className="muted">{vatOn ? 'On excl. VAT revenue' : 'Gross profit ÷ revenue'}</span></Card>
+        <Card className="metric-card"><p>Net margin</p><strong className={profitForPeriodExcl >= 0 ? 'positive' : 'negative'}>{(vatOn ? revenue.exclusive : revenue.inclusive) ? `${Math.round((profitForPeriodExcl / (vatOn ? revenue.exclusive : revenue.inclusive)) * 100)}%` : '—'}</strong><span className="muted">Profit after tax ÷ revenue</span></Card>
         <Card className="metric-card"><p>{vatOn ? 'Net VAT' : 'Orders in period'}</p><strong>{vatOn ? money(netVat) : periodOrders.length}</strong><span className="muted">{vatOn ? 'Output minus input VAT' : `${periodExpenses.length} expense entries`}</span></Card>
       </div>
     </div>
@@ -3238,10 +3370,13 @@ function SettingsPage({ company, setCompany, toast, tenantId }: { company: Compa
 }
 
 
-export default function Page() {
+export default function BackOfficeApp({ children }: { children?: React.ReactNode }) {
+  const pathname = usePathname()
+  const router = useRouter()
+  const matched = pageFromPath(pathname) ?? 'dashboard'
+  const active = matched
   const [auth, setAuth] = useState(false)
   const [booting, setBooting] = useState(true)
-  const [active, setActive] = useState<PageKey>('dashboard')
   const [drawer, setDrawer] = useState(false)
   const [confirmLogout, setConfirmLogout] = useState(false)
   const [toastMessage, setToastMessage] = useState('')
@@ -3253,6 +3388,7 @@ export default function Page() {
   const [expenses, setExpenses] = useState(seedExpenses)
   const [categories, setCategories] = useState(seedCategories)
   const [company, setCompany] = useState(seedCompany)
+  const [books, setBooks] = useState<AccountingBooks>(() => emptyBooks())
 
   const toast = (message: string) => {
     setToastMessage(message)
@@ -3302,13 +3438,31 @@ export default function Page() {
               amount: Number(line.amount ?? 0),
             }))
           : [{ id: newId(), description: String(e.category ?? 'Expense'), qty: 1, amount: Number(e.amount ?? 0) }]
-        return { id: String(e.id ?? newId()), date: parseExpenseDate(String(e.date ?? '')), category: String(e.category ?? ''), lines }
+        return {
+          id: String(e.id ?? newId()),
+          date: parseExpenseDate(String(e.date ?? '')),
+          category: String(e.category ?? ''),
+          vatInclusive: e.vatInclusive !== false,
+          vatClaimable: e.vatClaimable !== false,
+          lines,
+        }
       }))
     }
     const savedCategories = localStorage.getItem('lagoon-categories')
     if (savedCategories) setCategories(JSON.parse(savedCategories))
     const savedCompany = localStorage.getItem('lagoon-company')
     if (savedCompany) setCompany({ ...seedCompany, ...JSON.parse(savedCompany) })
+    const savedBooks = localStorage.getItem('lagoon-books')
+    if (savedBooks) {
+      try {
+        const parsed = JSON.parse(savedBooks) as AccountingBooks
+        setBooks({ ...emptyBooks(), ...parsed, accounts: parsed.accounts?.length ? parsed.accounts : emptyBooks().accounts })
+      } catch {
+        setBooks(emptyBooks())
+      }
+    } else {
+      setBooks(emptyBooks())
+    }
   }
 
   const loadRemote = async (userId: string) => {
@@ -3321,6 +3475,64 @@ export default function Page() {
     setOrders(workspace.orders)
     setExpenses(workspace.expenses)
     setExpenseCategoryMap(workspace.expenseCategories)
+    try {
+      setBooks(await booksApi.loadBooks(workspace.tenantId))
+    } catch (err) {
+      console.error(err)
+      setBooks(emptyBooks())
+      toast('Accounting is not installed yet. Run supabase/04-accounting.sql in Supabase.')
+    }
+  }
+
+  const reloadBooks = async () => {
+    if (!tenantId) return
+    try {
+      setBooks(await booksApi.loadBooks(tenantId))
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Could not reload the ledger')
+    }
+  }
+
+  const postSale = async (order: Order) => {
+    try {
+      if (tenantId) {
+        await booksApi.postSaleJournal(tenantId, books.accounts, books.journals, order, company.vatRegistered)
+        await reloadBooks()
+        return
+      }
+      setBooks(prev => {
+        const cleared = removeJournal(prev, 'sale', order.id)
+        const draft = buildSaleJournal(cleared.accounts, order, company.vatRegistered)
+        return draft ? upsertJournal(cleared, draft) : cleared
+      })
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Could not post the sale journal')
+    }
+  }
+
+  const postExpense = async (expense: Expense | null, deletedId?: string) => {
+    try {
+      if (deletedId) {
+        if (tenantId) await booksApi.deleteAutoJournal(tenantId, 'expense', deletedId)
+        setBooks(prev => removeJournal(prev, 'expense', deletedId))
+        if (tenantId) await reloadBooks()
+        return
+      }
+      if (!expense) return
+      const code = expenseAccountCode(expense.category, cogsExpenseCategories, distributionExpenseCategories, adminExpenseCategories)
+      if (tenantId) {
+        await booksApi.postExpenseJournal(tenantId, books.accounts, books.journals, expense, company.vatRegistered, code)
+        await reloadBooks()
+        return
+      }
+      const draft = buildExpenseJournal(books.accounts, expense, company.vatRegistered, code)
+      setBooks(prev => {
+        const cleared = removeJournal(prev, 'expense', expense.id)
+        return draft ? upsertJournal(cleared, draft) : cleared
+      })
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Could not post the expense journal')
+    }
   }
 
   useEffect(() => {
@@ -3356,7 +3568,17 @@ export default function Page() {
     localStorage.setItem('lagoon-expenses', JSON.stringify(expenses))
     localStorage.setItem('lagoon-categories', JSON.stringify(categories))
     localStorage.setItem('lagoon-company', JSON.stringify(company))
-  }, [auth, menu, tables, orders, expenses, categories, company])
+    localStorage.setItem('lagoon-books', JSON.stringify(books))
+  }, [auth, menu, tables, orders, expenses, categories, company, books])
+
+  useEffect(() => {
+    if (!auth) {
+      document.title = 'Pyramid Snack | Back office'
+      return
+    }
+    document.title = `${PAGE_TITLES[active][0]} | Pyramid Snack`
+    if (!pageFromPath(pathname)) router.replace(PAGE_PATH.dashboard)
+  }, [auth, active, pathname, router])
 
   const handleLogin = async (email: string, password: string) => {
     if (!isSupabaseConfigured) {
@@ -3386,7 +3608,7 @@ export default function Page() {
     setTenantId(null)
     setConfirmLogout(false)
     setAuth(false)
-    setActive('dashboard')
+    router.replace('/')
   }
 
   if (booting) {
@@ -3397,20 +3619,24 @@ export default function Page() {
 
   return (
     <div className={`app-shell ${drawer ? 'drawer-open' : ''}`}>
-      <Sidebar active={active} setActive={x => { setActive(x); setDrawer(false) }} company={company} logout={() => setConfirmLogout(true)} />
+      <Sidebar active={active} onNavigate={() => setDrawer(false)} company={company} logout={() => setConfirmLogout(true)} />
       <div className="main-area">
-        <Header active={active} mobileMenu={() => setDrawer(!drawer)} />
-        {active === 'dashboard' && <Dashboard orders={orders} expenses={expenses} />}
-        {active === 'menu' && <MenuPage menu={menu} setMenu={setMenu} categories={categories} company={company} toast={toast} tenantId={tenantId} />}
-        {active === 'categories' && <CategoriesPage categories={categories} setCategories={setCategories} toast={toast} tenantId={tenantId} />}
-        {active === 'tables' && <Tables tables={tables} setTables={setTables} toast={toast} tenantId={tenantId} />}
-        {active === 'orders' && <Orders orders={orders} setOrders={setOrders} menu={menu} company={company} toast={toast} tenantId={tenantId} />}
-        {active === 'expenses' && <Expenses expenses={expenses} setExpenses={setExpenses} company={company} toast={toast} tenantId={tenantId} expenseCategoryMap={expenseCategoryMap} />}
-        {active === 'pnl' && <Reports orders={orders} expenses={expenses} company={company} toast={toast} />}
-        {active === 'sales' && <SalesReport orders={orders} company={company} toast={toast} />}
-        {active === 'expense-report' && <ExpenseReport expenses={expenses} company={company} toast={toast} />}
-        {active === 'inventory-report' && <InventoryReport orders={orders} menu={menu} company={company} toast={toast} />}
-        {active === 'settings' && <SettingsPage company={company} setCompany={setCompany} toast={toast} tenantId={tenantId} />}
+        <Header active={matched} mobileMenu={() => setDrawer(!drawer)} />
+        {matched === 'dashboard' && <Dashboard orders={orders} expenses={expenses} vatOn={company.vatRegistered} purchaseAmounts={books.purchases.map(item => ({ date: item.date, amount: documentVat(purchaseTotal(item), item, company.vatRegistered).payable }))} />}
+        {matched === 'menu' && <MenuPage menu={menu} setMenu={setMenu} categories={categories} company={company} toast={toast} tenantId={tenantId} />}
+        {matched === 'categories' && <CategoriesPage categories={categories} setCategories={setCategories} toast={toast} tenantId={tenantId} />}
+        {matched === 'tables' && <Tables tables={tables} setTables={setTables} toast={toast} tenantId={tenantId} />}
+        {matched === 'orders' && <Orders orders={orders} setOrders={setOrders} menu={menu} company={company} toast={toast} tenantId={tenantId} onPosted={postSale} />}
+        {matched === 'expenses' && <Expenses expenses={expenses} setExpenses={setExpenses} company={company} toast={toast} tenantId={tenantId} expenseCategoryMap={expenseCategoryMap} onPosted={postExpense} />}
+        {matched === 'purchases' && <PurchasesPage books={books} setBooks={setBooks} tenantId={tenantId} vatOn={company.vatRegistered} toast={toast} reload={reloadBooks} />}
+        {matched === 'journals' && <JournalsPage books={books} setBooks={setBooks} tenantId={tenantId} vatOn={company.vatRegistered} toast={toast} reload={reloadBooks} />}
+        {matched === 'ledger' && <LedgerPage books={books} />}
+        {matched === 'cashbook' && <CashBookPage books={books} />}
+        {matched === 'pnl' && <Reports orders={orders} expenses={expenses} purchases={books.purchases} company={company} toast={toast} />}
+        {matched === 'sales' && <SalesReport orders={orders} company={company} toast={toast} />}
+        {matched === 'expense-report' && <ExpenseReport expenses={expenses} company={company} toast={toast} />}
+        {matched === 'inventory-report' && <InventoryReport orders={orders} menu={menu} company={company} toast={toast} />}
+        {matched === 'settings' && <SettingsPage company={company} setCompany={setCompany} toast={toast} tenantId={tenantId} />}
       </div>
       {confirmLogout && (
         <ConfirmDelete
@@ -3423,6 +3649,7 @@ export default function Page() {
         />
       )}
       {toastMessage && <div className="toast"><Check size={17} /> {toastMessage}</div>}
+      {children}
     </div>
   )
 }

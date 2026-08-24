@@ -1,4 +1,5 @@
 export type OrderStatus = 'New' | 'Completed' | 'Cancelled'
+export type PayMethod = 'cash' | 'bank' | 'credit'
 
 export type MenuItem = {
   id: string
@@ -15,7 +16,15 @@ export type MenuItem = {
 
 export type DiningTable = { id: string; number: number; capacity: number }
 export type ExpenseLine = { id: string; description: string; qty: number; amount: number }
-export type Expense = { id: string; date: string; category: string; lines: ExpenseLine[]; categoryId?: string }
+export type Expense = {
+  id: string
+  date: string
+  category: string
+  lines: ExpenseLine[]
+  categoryId?: string
+  vatInclusive?: boolean
+  vatClaimable?: boolean
+}
 export type OrderAddOn = { id: string; name: string; price: number; menuItemId?: string | null }
 export type OrderLine = {
   id: string
@@ -30,6 +39,7 @@ export type Order = {
   clientName: string
   tableNumber: number
   status: OrderStatus
+  paymentMethod?: PayMethod
   lines: OrderLine[]
   total: number
   time: string
