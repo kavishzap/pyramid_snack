@@ -278,10 +278,10 @@ export function buildExpenseJournal(
   const parts = documentVat(entered, expense, vatRegistered)
   if (parts.payable <= 0) return null
   const expenseAccount = requireAccount(accounts, expenseAccountCode)
-  const cash = requireAccount(accounts, ACCOUNT_CODES.cash)
+  const paidFrom = cashOrBank(accounts, expense.paymentMethod === 'bank' ? 'bank' : 'cash')
   const lines = [
     line(expenseAccount, parts.expense, 0, expense.category || 'Expense'),
-    line(cash, 0, parts.payable, `Paid ${expense.category || 'expense'}`),
+    line(paidFrom, 0, parts.payable, `Paid ${expense.category || 'expense'}`),
   ]
   if (parts.inputVat) {
     lines.push(line(requireAccount(accounts, ACCOUNT_CODES.inputVat), parts.inputVat, 0, 'Input VAT on expense'))
@@ -290,7 +290,7 @@ export function buildExpenseJournal(
     date: expense.date,
     source: 'expense',
     sourceRef: expense.id,
-    memo: `Expense · ${expense.category}${parts.inputVat ? '' : vatRegistered ? ' · VAT not claimed' : ''}`,
+    memo: `Expense · ${expense.category} · ${expense.paymentMethod === 'bank' ? 'bank' : 'cash'}${parts.inputVat ? '' : vatRegistered ? ' · VAT not claimed' : ''}`,
     lines,
   }
 }

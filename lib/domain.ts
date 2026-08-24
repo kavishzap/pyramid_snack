@@ -22,6 +22,7 @@ export type Expense = {
   category: string
   lines: ExpenseLine[]
   categoryId?: string
+  paymentMethod?: 'cash' | 'bank'
   vatInclusive?: boolean
   vatClaimable?: boolean
 }

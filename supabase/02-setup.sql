@@ -143,6 +143,7 @@ CREATE TABLE expenses (
   total_amount    NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (total_amount >= 0),
   vat_inclusive   BOOLEAN NOT NULL DEFAULT TRUE,
   vat_claimable   BOOLEAN NOT NULL DEFAULT TRUE,
+  payment_method  TEXT NOT NULL DEFAULT 'cash' CHECK (payment_method IN ('cash', 'bank')),
   created_by      UUID REFERENCES auth.users(id) ON DELETE SET NULL,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()

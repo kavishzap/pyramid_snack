@@ -439,6 +439,7 @@ export async function fetchExpenses(tenantId: string): Promise<Expense[]> {
       categoryId: String(row.category_id ?? ''),
       vatInclusive: row.vat_inclusive !== false,
       vatClaimable: row.vat_claimable !== false,
+      paymentMethod: row.payment_method === 'bank' ? 'bank' : 'cash',
       lines: linesRaw
         .sort((a, b) => Number(a.sort_order ?? 0) - Number(b.sort_order ?? 0))
         .map(line => ({
@@ -461,6 +462,7 @@ export async function saveExpense(tenantId: string, expense: Expense, categoryId
     total_amount: total,
     vat_inclusive: expense.vatInclusive !== false,
     vat_claimable: expense.vatClaimable !== false,
+    payment_method: expense.paymentMethod === 'bank' ? 'bank' : 'cash',
   }
 
   let expenseId = expense.id || null

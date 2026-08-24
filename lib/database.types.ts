@@ -203,6 +203,7 @@ export type Database = {
           total_amount: number
           vat_inclusive: boolean
           vat_claimable: boolean
+          payment_method: 'cash' | 'bank'
           created_by: string | null
           created_at: string
           updated_at: string
@@ -215,6 +216,7 @@ export type Database = {
           total_amount?: number
           vat_inclusive?: boolean
           vat_claimable?: boolean
+          payment_method?: 'cash' | 'bank'
           created_by?: string | null
         }
         Update: Partial<Database['public']['Tables']['expenses']['Row']>

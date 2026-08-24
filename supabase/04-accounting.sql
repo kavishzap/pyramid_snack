@@ -307,7 +307,19 @@ CREATE POLICY supplier_payments_all ON supplier_payments
 
 ALTER TABLE expenses
   ADD COLUMN IF NOT EXISTS vat_inclusive BOOLEAN NOT NULL DEFAULT TRUE,
-  ADD COLUMN IF NOT EXISTS vat_claimable BOOLEAN NOT NULL DEFAULT TRUE;
+  ADD COLUMN IF NOT EXISTS vat_claimable BOOLEAN NOT NULL DEFAULT TRUE,
+  ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'cash';
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'expenses_payment_method_check'
+  ) THEN
+    ALTER TABLE expenses
+      ADD CONSTRAINT expenses_payment_method_check
+      CHECK (payment_method IN ('cash', 'bank'));
+  END IF;
+END $$;
 
 ALTER TABLE purchases
   ADD COLUMN IF NOT EXISTS vat_inclusive BOOLEAN NOT NULL DEFAULT TRUE,

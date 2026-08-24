@@ -89,7 +89,7 @@ const adminExpenseCategories = new Set<string>([
   'Miscellaneous',
 ])
 
-const CORPORATE_TAX_RATE = 0.15 // Mauritius headline company tax rate under the Income Tax Act
+
 
 type ExpenseBucket = 'cogs' | 'distribution' | 'admin' | 'other'
 const expenseBucket = (category: string): ExpenseBucket => {
@@ -1712,6 +1712,7 @@ function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCate
     category: 'Produce',
     vatInclusive: true,
     vatClaimable: vatOn,
+    paymentMethod: 'cash',
     lines: [{ id: newId(), description: '', qty: 1, amount: 0 }],
   })
   const confirmDelete = async () => {
@@ -1754,6 +1755,7 @@ function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCate
       category: String(d.get('category')).trim(),
       vatInclusive: editing.vatInclusive !== false,
       vatClaimable: editing.vatClaimable !== false,
+      paymentMethod: editing.paymentMethod === 'bank' ? 'bank' : 'cash',
       lines,
     }
     try {
@@ -1788,12 +1790,13 @@ function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCate
         <div className="table-summary"><strong>Recent expenses</strong></div>
         <div className="data-table-wrap">
           <table>
-            <thead><tr><th>Date</th><th>Category</th><th>Line items</th><th className="align-right">Amount</th><th /></tr></thead>
+            <thead><tr><th>Date</th><th>Category</th><th>Paid by</th><th>Line items</th><th className="align-right">Amount</th><th /></tr></thead>
             <tbody>
               {paged.slice.map(x => (
                 <tr key={x.id}>
                   <td className="muted">{formatExpenseDate(x.date)}</td>
                   <td><Badge>{x.category}</Badge></td>
+                  <td className="muted">{x.paymentMethod === 'bank' ? 'Bank' : 'Cash'}</td>
                   <td>
                     <div className="line-preview">
                       {x.lines.map(line => (
@@ -1811,10 +1814,10 @@ function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCate
                       </span>
                     )}
                   </td>
-                  <td><div className="row-actions"><button className="more-button" onClick={() => setEditing({ ...x, vatInclusive: x.vatInclusive !== false, vatClaimable: x.vatClaimable !== false, lines: x.lines.map(l => ({ ...l })) })} aria-label={`Edit ${x.category} expense`}><MoreHorizontal size={18} /></button><button className="more-button" onClick={() => setPendingDelete(x)} aria-label={`Delete ${x.category} expense`}><Trash2 size={16} /></button></div></td>
+                  <td><div className="row-actions"><button className="more-button" onClick={() => setEditing({ ...x, vatInclusive: x.vatInclusive !== false, vatClaimable: x.vatClaimable !== false, paymentMethod: x.paymentMethod === 'bank' ? 'bank' : 'cash', lines: x.lines.map(l => ({ ...l })) })} aria-label={`Edit ${x.category} expense`}><MoreHorizontal size={18} /></button><button className="more-button" onClick={() => setPendingDelete(x)} aria-label={`Delete ${x.category} expense`}><Trash2 size={16} /></button></div></td>
                 </tr>
               ))}
-              {!shown.length && <tr><td colSpan={5} className="muted">No expenses yet.</td></tr>}
+              {!shown.length && <tr><td colSpan={6} className="muted">No expenses yet.</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1831,6 +1834,12 @@ function Expenses({ expenses, setExpenses, company, toast, tenantId, expenseCate
                     <option value={editing.category}>{editing.category}</option>
                   )}
                   {expenseCategories.map(cat => <option key={cat} value={cat}>{cat}</option>)}
+                </select>
+              </label>
+              <label>Paid by
+                <select value={editing.paymentMethod === 'bank' ? 'bank' : 'cash'} onChange={e => setEditing({ ...editing, paymentMethod: e.target.value === 'bank' ? 'bank' : 'cash' })}>
+                  <option value="cash">Cash</option>
+                  <option value="bank">Bank</option>
                 </select>
               </label>
               {vatOn && (
@@ -1884,7 +1893,7 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
   const [preset, setPreset] = useState<Preset>('month')
   const [from, setFrom] = useState(monthStart)
   const [to, setTo] = useState(today)
-  const [status, setStatus] = useState<'All' | OrderStatus>('All')
+  const [status, setStatus] = useState<'All' | OrderStatus>('Completed')
   const [query, setQuery] = useState('')
   const [tableFilter, setTableFilter] = useState('')
   const [itemFilter, setItemFilter] = useState('All')
@@ -1916,7 +1925,7 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
     .sort((a, b) => (a.date === b.date ? b.id.localeCompare(a.id) : b.date.localeCompare(a.date)))
 
   const vatOn = Boolean(company.vatRegistered)
-  const billable = filtered.filter(o => o.status !== 'Cancelled')
+  const billable = filtered.filter(o => o.status === 'Completed')
   const cancelled = filtered.filter(o => o.status === 'Cancelled')
   const salesTotal = billable.reduce((sum, o) => sum + o.total, 0)
   const salesVat = vatSplit(salesTotal, vatOn)
@@ -1963,7 +1972,7 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
 
   const clearFilters = () => {
     applyPreset('month')
-    setStatus('All')
+    setStatus('Completed')
     setQuery('')
     setTableFilter('')
     setItemFilter('All')
@@ -2007,7 +2016,7 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
               order.status,
               ...vatPdfCells(order.total, vatOn),
             ]),
-            foot: ['Total (excluding cancelled)', '', '', '', '', ...vatPdfCells(salesTotal, vatOn)],
+            foot: ['Total completed', '', '', '', '', ...vatPdfCells(salesTotal, vatOn)],
           },
           {
             title: 'By item',
@@ -2029,7 +2038,7 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
           company.vatRegistered
             ? `Amounts are VAT inclusive at ${Math.round(VAT_RATE * 100)}%. Excl. VAT = inclusive / 1.${Math.round(VAT_RATE * 100)}.`
             : 'The company is not VAT registered.',
-          'Cancelled orders are listed but excluded from gross sales.',
+          'Cancelled orders are listed when you choose that status, but gross sales only include completed tickets.',
         ],
       })
       toast('Sales report PDF downloaded')
@@ -2168,7 +2177,7 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
               {!!filtered.length && (
                 <tfoot>
                   <tr>
-                    <td colSpan={5}><strong>Total (excluding cancelled)</strong></td>
+                    <td colSpan={5}><strong>Total completed</strong></td>
                     <VatAmountCells inclusive={salesTotal} vatOn={vatOn} />
                   </tr>
                 </tfoot>
@@ -3035,14 +3044,11 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
     inclusive: grossProfit.inclusive - distributionCosts.inclusive - administrativeExpenses.inclusive - otherExpenses.inclusive,
   }
   const financeCosts = emptyPnl()
-  const profitBeforeTax: PnlParts = {
+  const profitForPeriod: PnlParts = {
     exclusive: operatingProfit.exclusive - financeCosts.exclusive,
     vat: operatingProfit.vat - financeCosts.vat,
     inclusive: operatingProfit.inclusive - financeCosts.inclusive,
   }
-  const incomeTaxExpense = profitBeforeTax.exclusive > 0 ? profitBeforeTax.exclusive * CORPORATE_TAX_RATE : 0
-  const profitForPeriodExcl = profitBeforeTax.exclusive - incomeTaxExpense
-  const profitForPeriodIncl = profitBeforeTax.inclusive - incomeTaxExpense
   const netVat = revenue.vat - (costOfSales.vat + distributionCosts.vat + administrativeExpenses.vat + otherExpenses.vat)
 
   const periodLabel =
@@ -3115,11 +3121,7 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
         pnlRow('Other expenses', negPnl(otherExpenses)),
         ...(otherLines.length ? otherLines.map(([cat, parts]) => pnlRow(cat, negPnl(parts), { indent: true })) : [pnlRow('Nil', emptyPnl(), { indent: true })]),
         pnlRow('Finance costs', financeCosts),
-        pnlRow('Profit / (loss) before tax', profitBeforeTax),
-        pnlRow('Income tax expense (estimated at 15%)', { exclusive: -incomeTaxExpense, vat: 0, inclusive: -incomeTaxExpense }, { noVat: true }),
-        vatOn
-          ? ['Profit / (loss) for the period', money(profitForPeriodExcl), '-', money(profitForPeriodIncl)]
-          : pnlRow('Profit / (loss) for the period', { exclusive: profitForPeriodExcl, vat: 0, inclusive: profitForPeriodIncl }),
+        pnlRow('Profit / (loss) for the period', profitForPeriod),
         ...(vatOn ? [['Net VAT position (output minus input)', '-', money(netVat), '-']] : []),
       ]
       const denom = vatOn ? revenue.exclusive : revenue.inclusive
@@ -3130,9 +3132,9 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
         filename: reportFileName('pnl-report'),
         kpis: [
           { label: 'Gross margin', value: denom ? `${Math.round((grossProfit.exclusive / denom) * 100)}%` : '-' },
-          { label: 'Net margin', value: denom ? `${Math.round((profitForPeriodExcl / denom) * 100)}%` : '-' },
+          { label: 'Net margin', value: denom ? `${Math.round((profitForPeriod.exclusive / denom) * 100)}%` : '-' },
           { label: vatOn ? 'Net VAT' : 'Orders in period', value: vatOn ? money(netVat) : String(periodOrders.length) },
-          { label: vatOn ? 'VAT incl. profit' : 'Profit for period', value: money(profitForPeriodIncl) },
+          { label: vatOn ? 'VAT incl. profit' : 'Profit for period', value: money(profitForPeriod.inclusive) },
         ],
         tables: [
           {
@@ -3147,7 +3149,7 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
           ...(vatOn ? [`VAT is calculated at the standard Mauritius rate of ${Math.round(VAT_RATE * 100)}%. Only claimable input VAT is stripped from the trading result.`] : []),
           'Cost of sales aggregates purchases of goods plus Produce, Meat & seafood, Dairy, Dry goods, Beverages, Alcohol, and Packaging.',
           'Operating expenses are classified by function (distribution, administrative, and other).',
-          `Income tax is an illustrative charge at 15% on profit before tax${vatOn ? ' exclusive of VAT' : ''}. This is not an MRA return.`,
+          'Income tax is not computed on this management statement.',
           `This statement is a management report for ${company.name || 'Pyramid Snack'} and should be reviewed before statutory filing.`,
         ],
       })
@@ -3192,7 +3194,7 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
           </div>
           <div className="pnl-meta">
             <strong>{periodLabel}</strong>
-            <span className="muted">Income Tax Act company tax rate applied: 15%</span>
+            <span className="muted">Management profit or loss · tax not computed</span>
             {company.address && <span className="muted">{company.address}</span>}
           </div>
         </div>
@@ -3227,16 +3229,7 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
               {!otherLines.length && row('Nil', emptyPnl(), { key: 'other-empty', indent: true, muted: true })}
 
               {row('Finance costs', financeCosts, { bold: true })}
-              {row('Profit / (loss) before tax', profitBeforeTax, { total: true, bold: true })}
-              {row('Income tax expense (estimated at 15%)', { exclusive: -incomeTaxExpense, vat: 0, inclusive: -incomeTaxExpense }, { bold: true, noVat: true })}
-              {vatOn ? (
-                <tr className="pnl-total pnl-bold">
-                  <td>Profit / (loss) for the period</td>
-                  <td className={`align-right ${profitForPeriodExcl < 0 ? 'negative' : ''}`}>{money(profitForPeriodExcl)}</td>
-                  <td className="align-right muted">—</td>
-                  <td className={`align-right ${profitForPeriodIncl < 0 ? 'negative' : ''}`}>{money(profitForPeriodIncl)}</td>
-                </tr>
-              ) : row('Profit / (loss) for the period', { exclusive: profitForPeriodExcl, vat: 0, inclusive: profitForPeriodIncl }, { total: true, bold: true })}
+              {row('Profit / (loss) for the period', profitForPeriod, { total: true, bold: true })}
               {vatOn && (
                 <tr className="pnl-bold">
                   <td>Net VAT position (output minus input)</td>
@@ -3256,7 +3249,7 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
             {vatOn && <li>VAT is calculated at the standard Mauritius rate of {Math.round(VAT_RATE * 100)}%. Claimable input VAT is shown in the VAT column and excluded from the trading result. Bills marked not claimable keep VAT inside the expense.</li>}
             <li>Cost of sales aggregates purchases of goods plus Produce, Meat &amp; seafood, Dairy, Dry goods, Beverages, Alcohol, and Packaging.</li>
             <li>Operating expenses are classified by function under IFRS for SMEs (distribution, administrative, and other).</li>
-            <li>Income tax is an illustrative charge at the Mauritius headline company rate of 15% on profit before tax{vatOn ? ' exclusive of VAT' : ''}. This is not an MRA return.</li>
+            <li>Income tax is not computed on this management statement.</li>
             {vatOn && <li>Net VAT position is output VAT on sales less input VAT on recorded expenses for the period. Actual VAT return figures may differ after adjustments.</li>}
             <li>This statement is a management report for {company.name || 'Pyramid Snack'} and should be reviewed by a licensed auditor/accountant before statutory filing.</li>
           </ol>
@@ -3265,7 +3258,7 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
 
       <div className="metric-grid expense-metrics" style={{ marginTop: 18 }}>
         <Card className="metric-card"><p>Gross margin</p><strong>{(vatOn ? revenue.exclusive : revenue.inclusive) ? `${Math.round((grossProfit.exclusive / (vatOn ? revenue.exclusive : revenue.inclusive)) * 100)}%` : '—'}</strong><span className="muted">{vatOn ? 'On excl. VAT revenue' : 'Gross profit ÷ revenue'}</span></Card>
-        <Card className="metric-card"><p>Net margin</p><strong className={profitForPeriodExcl >= 0 ? 'positive' : 'negative'}>{(vatOn ? revenue.exclusive : revenue.inclusive) ? `${Math.round((profitForPeriodExcl / (vatOn ? revenue.exclusive : revenue.inclusive)) * 100)}%` : '—'}</strong><span className="muted">Profit after tax ÷ revenue</span></Card>
+        <Card className="metric-card"><p>Net margin</p><strong className={profitForPeriod.exclusive >= 0 ? 'positive' : 'negative'}>{(vatOn ? revenue.exclusive : revenue.inclusive) ? `${Math.round((profitForPeriod.exclusive / (vatOn ? revenue.exclusive : revenue.inclusive)) * 100)}%` : '—'}</strong><span className="muted">Profit ÷ revenue</span></Card>
         <Card className="metric-card"><p>{vatOn ? 'Net VAT' : 'Orders in period'}</p><strong>{vatOn ? money(netVat) : periodOrders.length}</strong><span className="muted">{vatOn ? 'Output minus input VAT' : `${periodExpenses.length} expense entries`}</span></Card>
       </div>
     </div>
@@ -3444,6 +3437,7 @@ export default function BackOfficeApp({ children }: { children?: React.ReactNode
           category: String(e.category ?? ''),
           vatInclusive: e.vatInclusive !== false,
           vatClaimable: e.vatClaimable !== false,
+          paymentMethod: e.paymentMethod === 'bank' ? 'bank' : 'cash',
           lines,
         }
       }))
