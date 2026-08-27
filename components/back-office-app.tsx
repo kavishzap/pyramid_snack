@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
@@ -18,7 +18,13 @@ import {
   type OrderLine,
   type OrderStatus,
   type PayMethod,
+  isAddOnCategory,
   newId,
+  orderDiscountAmount,
+  orderDiscountFactor,
+  orderLineAmount,
+  orderSubtotal,
+  settleOrderAmounts,
 } from '@/lib/domain'
 import { isSupabaseConfigured } from '@/lib/supabase/client'
 import * as api from '@/lib/api/restaurant'
@@ -40,6 +46,12 @@ import {
 } from '@/lib/accounting'
 import { downloadReportPdf, reportFileName } from '@/lib/reportPdf'
 import { PAGE_PATH, PAGE_TITLES, pageFromPath, type PageKey } from '@/lib/routes'
+import {
+  clearWorkspaceFetchMark,
+  getWorkspaceSnapshot,
+  markWorkspaceFetched,
+  setWorkspaceSnapshot,
+} from '@/lib/workspace-cache'
 
 const expenseCategories = [
   'Produce',
@@ -150,11 +162,7 @@ const inYearMonth = (iso: string, year: number, month?: number) => {
   if (month !== undefined && d.getMonth() !== month) return false
   return true
 }
-const orderLineTotal = (line: OrderLine) => {
-  const addOns = line.addOns.reduce((sum, a) => sum + (Number(a.price) || 0), 0)
-  return (Number(line.qty) || 0) * ((Number(line.unitPrice) || 0) + addOns)
-}
-const orderTotal = (order: Order) => order.lines.reduce((sum, line) => sum + orderLineTotal(line), 0)
+const orderLineTotal = (line: OrderLine) => orderLineAmount(line)
 const formatOrderLine = (line: OrderLine) => {
   const addOnText = line.addOns.length ? ` (+ ${line.addOns.map(a => a.name).join(', ')})` : ''
   return `${line.qty}× ${line.name}${addOnText}`
@@ -201,15 +209,27 @@ const normalizeOrder = (raw: Record<string, unknown>, index: number): Order => {
   const tableNumber = typeof tableRaw === 'string'
     ? Number(String(tableRaw).replace(/\D/g, '')) || 1
     : Number(tableRaw) || 1
-  const storedTotal = Number(raw.total ?? 0) || 0
-  const computed = lines.length ? lines.reduce((sum, line) => sum + orderLineTotal(line), 0) : 0
+  const storedTotal = Number(raw.total ?? raw.total_amount ?? 0) || 0
+  const amounts = settleOrderAmounts({
+    lines,
+    subtotal: Number(raw.subtotal ?? raw.subtotal_amount ?? 0) || 0,
+    discount: Number(raw.discount ?? raw.discount_amount ?? 0) || 0,
+    total: storedTotal,
+  })
+  let discount = amounts.discount
+  if (!discount && storedTotal > 0 && amounts.subtotal > storedTotal) {
+    discount = Math.round((amounts.subtotal - storedTotal) * 100) / 100
+  }
+  const settled = settleOrderAmounts({ lines, subtotal: amounts.subtotal, discount, total: storedTotal })
   return {
     id: String(raw.id ?? `#${1000 + index}`),
     clientName: String(raw.clientName ?? raw.guest ?? 'Walk-in guest'),
     tableNumber,
     status: normalizeOrderStatus(raw.status),
     lines,
-    total: computed > 0 ? computed : storedTotal,
+    subtotal: settled.subtotal,
+    discount: settled.discount,
+    total: settled.subtotal > 0 ? settled.total : storedTotal,
     time: String(raw.time ?? ''),
     date: parseExpenseDate(String(raw.date ?? new Date().toISOString().slice(0, 10))),
     paymentMethod: raw.paymentMethod === 'bank' || raw.paymentMethod === 'credit' || raw.payment_method === 'bank' || raw.payment_method === 'credit'
@@ -218,6 +238,7 @@ const normalizeOrder = (raw: Record<string, unknown>, index: number): Order => {
   }
 }
 const sumOrders = (list: Order[]) => list.filter(o => o.status === 'Completed').reduce((sum, o) => sum + o.total, 0)
+const sumDiscounts = (list: Order[]) => list.filter(o => o.status === 'Completed').reduce((sum, o) => sum + orderDiscountAmount(o), 0)
 const sumExpenses = (list: Expense[], vatOn: boolean) => list.reduce((sum, e) => sum + expenseSpend(e, vatOn), 0)
 const monthLabels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
@@ -490,6 +511,17 @@ const vatPdfCells = (inclusive: number, vatOn: boolean) => {
   const parts = vatSplit(inclusive, true)
   return [money(parts.exclusive), money(parts.vat), money(parts.inclusive)]
 }
+
+function OrderAmountsCell({ order, compact = false }: { order: Order; compact?: boolean }) {
+  const { subtotal, discount, total } = settleOrderAmounts(order)
+  return (
+    <div className={`order-money-stack${compact ? ' compact' : ''}`}>
+      <div className="muted">Subtotal {money(subtotal)}</div>
+      <div className={discount > 0 ? '' : 'muted'}>Discount {discount > 0 ? `−${money(discount)}` : money(0)}</div>
+      <strong>Total {money(total)}</strong>
+    </div>
+  )
+}
 function Dialog({ title, close, children, wide }: { title: string; close: () => void; children: React.ReactNode; wide?: boolean }) {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -545,7 +577,7 @@ function FormActions({ close, onDelete }: { close: () => void; onDelete?: () => 
     <div className="dialog-actions">
       {onDelete && <Button variant="danger" type="button" onClick={onDelete}><Trash2 size={16} /> Delete</Button>}
       <span className="dialog-actions-spacer" />
-      <Button variant="secondary" onClick={close}>Cancel</Button>
+      <Button variant="secondary" type="button" onClick={close}>Cancel</Button>
       <Button type="submit"><Check size={16} /> Save</Button>
     </div>
   )
@@ -601,7 +633,12 @@ function Login({ onLogin }: { onLogin: (email: string, password: string) => Prom
               try {
                 await onLogin(email, password)
               } catch (err) {
-                setError(err instanceof Error ? err.message : 'Sign-in failed')
+                const message = err instanceof Error
+                  ? err.message
+                  : (err && typeof err === 'object' && 'message' in err && typeof (err as { message: unknown }).message === 'string'
+                    ? (err as { message: string }).message
+                    : 'Sign-in failed')
+                setError(message)
               } finally {
                 setBusy(false)
               }
@@ -853,6 +890,7 @@ function Dashboard({ orders, expenses, purchaseAmounts = [], vatOn = false }: { 
   const salesOverall = sumOrders(orders)
   const salesYear = sumOrders(orders.filter(o => inYearMonth(o.date, year)))
   const salesMonth = sumOrders(orders.filter(o => inYearMonth(o.date, year, month)))
+  const discountsMonth = sumDiscounts(orders.filter(o => inYearMonth(o.date, year, month)))
 
   const expenseOverall = sumExpenses(expenses, vatOn) + sumPurchases(purchaseAmounts)
   const expenseYear = sumExpenses(expenses.filter(e => inYearMonth(e.date, year)), vatOn) + sumPurchases(purchaseAmounts.filter(row => inYearMonth(row.date, year)))
@@ -941,6 +979,7 @@ function Dashboard({ orders, expenses, purchaseAmounts = [], vatOn = false }: { 
             <div><span>This year</span><strong>{money(salesYear)}</strong></div>
             <div><span>This month</span><strong>{money(salesMonth)}</strong></div>
           </div>
+          <span className="muted">Net after discount{discountsMonth > 0 ? ` · this month −${money(discountsMonth)}` : ''}</span>
         </Card>
         <Card className="metric-card summary-card">
           <p>Total expense</p>
@@ -963,7 +1002,7 @@ function Dashboard({ orders, expenses, purchaseAmounts = [], vatOn = false }: { 
   )
 }
 
-function CategoriesPage({ categories, setCategories, toast, tenantId }: { categories: Category[]; setCategories: React.Dispatch<React.SetStateAction<Category[]>>; toast: (x: string) => void; tenantId: string | null }) {
+function CategoriesPage({ categories, setCategories, toast, tenantId, onMutated }: { categories: Category[]; setCategories: React.Dispatch<React.SetStateAction<Category[]>>; toast: (x: string) => void; tenantId: string | null; onMutated?: () => Promise<void> }) {
   const [editing, setEditing] = useState<Category | null>(null)
   const [pendingDelete, setPendingDelete] = useState<Category | null>(null)
   const [query, setQuery] = useState('')
@@ -978,6 +1017,7 @@ function CategoriesPage({ categories, setCategories, toast, tenantId }: { catego
       setCategories(xs => editing?.id ? xs.map(x => x.id === editing.id ? category : x) : [category, ...xs])
       setEditing(null)
       toast(editing?.id ? 'Category updated' : 'Category added')
+      await onMutated?.()
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not save category')
     }
@@ -990,6 +1030,7 @@ function CategoriesPage({ categories, setCategories, toast, tenantId }: { catego
       setPendingDelete(null)
       setEditing(null)
       toast('Category deleted')
+      await onMutated?.()
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not delete category')
     }
@@ -1042,12 +1083,13 @@ function CategoriesPage({ categories, setCategories, toast, tenantId }: { catego
   )
 }
 
-function MenuPage({ menu, setMenu, categories, company, toast, tenantId }: { menu: MenuItem[]; setMenu: React.Dispatch<React.SetStateAction<MenuItem[]>>; categories: Category[]; company: CompanySettings; toast: (x: string) => void; tenantId: string | null }) {
+function MenuPage({ menu, setMenu, categories, company, toast, tenantId, onMutated }: { menu: MenuItem[]; setMenu: React.Dispatch<React.SetStateAction<MenuItem[]>>; categories: Category[]; company: CompanySettings; toast: (x: string) => void; tenantId: string | null; onMutated?: () => Promise<void> }) {
   const [categoryFilter, setCategoryFilter] = useState('all')
   const [serviceFilter, setServiceFilter] = useState<'all' | 'day' | 'night' | 'happyHour'>('all')
   const [query, setQuery] = useState('')
   const [editing, setEditing] = useState<MenuItem | null>(null)
   const [pendingDelete, setPendingDelete] = useState<MenuItem | null>(null)
+  const [formError, setFormError] = useState('')
   const shown = menu.filter(x => {
     if (categoryFilter !== 'all' && x.category !== categoryFilter) return false
     if (serviceFilter === 'day' && !x.day) return false
@@ -1075,13 +1117,23 @@ function MenuPage({ menu, setMenu, categories, company, toast, tenantId }: { men
   const save = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     if (!editing) return
+    setFormError('')
     const d = new FormData(e.currentTarget)
+    const isAddOn = isAddOnCategory(String(d.get('category')))
+    const targetCategories = isAddOn
+      ? [...new Set((editing.targetCategories ?? []).map(name => name.trim()).filter(Boolean))]
+      : undefined
+    if (isAddOn && !targetCategories?.length) {
+      setFormError('Choose at least one targeted category')
+      return
+    }
     const draft: MenuItem = {
       id: editing.id || '',
       name: String(d.get('name')).trim(),
       description: String(d.get('description')).trim(),
       category: String(d.get('category')),
-      allowAddOn: d.get('allowAddOn') === 'on',
+      allowAddOn: isAddOn ? false : d.get('allowAddOn') === 'on',
+      targetCategories,
       sellingPrice: Number(d.get('sellingPrice')),
       manufacturedPrice: Number(d.get('manufacturedPrice')),
       day: d.get('day') === 'on',
@@ -1090,14 +1142,21 @@ function MenuPage({ menu, setMenu, categories, company, toast, tenantId }: { men
     }
     try {
       const categoryId = categories.find(c => c.name === draft.category)?.id ?? null
+      const targetCategoryIds = (targetCategories ?? [])
+        .map(name => categories.find(c => c.name === name)?.id)
+        .filter((id): id is string => Boolean(id))
       const item = tenantId
-        ? await api.saveMenuItem(tenantId, draft, categoryId)
+        ? await api.saveMenuItem(tenantId, draft, categoryId, targetCategoryIds)
         : { ...draft, id: draft.id || newId() }
       setMenu(xs => editing.id ? xs.map(x => x.id === editing.id ? item : x) : [item, ...xs])
       setEditing(null)
+      setFormError('')
       toast(editing.id ? 'Menu item updated' : 'Menu item added')
+      await onMutated?.()
     } catch (err) {
-      toast(err instanceof Error ? err.message : 'Could not save menu item')
+      const message = err instanceof Error ? err.message : 'Could not save menu item'
+      setFormError(message)
+      toast(message)
     }
   }
   const confirmDelete = async () => {
@@ -1108,6 +1167,7 @@ function MenuPage({ menu, setMenu, categories, company, toast, tenantId }: { men
       setPendingDelete(null)
       setEditing(null)
       toast('Menu item deleted')
+      await onMutated?.()
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not delete menu item')
     }
@@ -1151,7 +1211,7 @@ function MenuPage({ menu, setMenu, categories, company, toast, tenantId }: { men
             ))}
           </div>
         </div>
-        <Button onClick={() => setEditing(blank())}><Plus size={17} /> Add menu item</Button>
+        <Button onClick={() => { setFormError(''); setEditing(blank()) }}><Plus size={17} /> Add menu item</Button>
       </div>
       <Card className="table-card">
         <div className="table-summary">
@@ -1187,11 +1247,16 @@ function MenuPage({ menu, setMenu, categories, company, toast, tenantId }: { men
                     <strong>{item.name}</strong>
                     {item.description ? <div className="muted table-desc">{item.description}</div> : null}
                   </td>
-                  <td><Badge>{item.category || 'Uncategorised'}</Badge></td>
+                  <td>
+                    <Badge>{item.category || 'Uncategorised'}</Badge>
+                    {isAddOnCategory(item.category) && item.targetCategories?.length ? (
+                      <div className="muted">For {item.targetCategories.join(', ')}</div>
+                    ) : null}
+                  </td>
                   <td>{money(item.sellingPrice)}</td>
                   <td className="muted">{money(item.manufacturedPrice)}</td>
                   <td><strong>{formatProfitCoefficient(item.sellingPrice, item.manufacturedPrice)}</strong></td>
-                  <td className="muted">{item.allowAddOn ? 'Yes' : 'No'}</td>
+                  <td className="muted">{isAddOnCategory(item.category) ? 'Add-on' : (item.allowAddOn ? 'Yes' : 'No')}</td>
                   <td>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
                       {item.day && <Badge>Day</Badge>}
@@ -1200,7 +1265,7 @@ function MenuPage({ menu, setMenu, categories, company, toast, tenantId }: { men
                       {!item.day && !item.night && !item.happyHour && <span className="muted">—</span>}
                     </div>
                   </td>
-                  <td><div className="row-actions"><button className="more-button" onClick={() => setEditing(item)} aria-label={`Edit ${item.name}`}><MoreHorizontal size={18} /></button><button className="more-button" onClick={() => setPendingDelete(item)} aria-label={`Delete ${item.name}`}><Trash2 size={16} /></button></div></td>
+                  <td><div className="row-actions"><button className="more-button" onClick={() => { setFormError(''); setEditing(item) }} aria-label={`Edit ${item.name}`}><MoreHorizontal size={18} /></button><button className="more-button" onClick={() => setPendingDelete(item)} aria-label={`Delete ${item.name}`}><Trash2 size={16} /></button></div></td>
                 </tr>
               ))}
               {!shown.length && <tr><td colSpan={8} className="muted">No menu items match these filters.</td></tr>}
@@ -1210,17 +1275,55 @@ function MenuPage({ menu, setMenu, categories, company, toast, tenantId }: { men
         <TablePagination {...paged} noun={shown.length === 1 ? 'item' : 'items'} />
       </Card>
       {editing && !pendingDelete && (
-        <Dialog title={editing.id ? 'Edit menu item' : 'Add menu item'} close={() => setEditing(null)}>
+        <Dialog title={editing.id ? 'Edit menu item' : 'Add menu item'} close={() => { setFormError(''); setEditing(null) }}>
           <form onSubmit={save}>
             <div className="form-grid">
               <label className="full-span">Name<input name="name" defaultValue={editing.name} required /></label>
               <label className="full-span">Description<textarea name="description" defaultValue={editing.description} rows={2} /></label>
               <label>Category
-                <select name="category" defaultValue={editing.category}>
+                <select
+                  name="category"
+                  value={editing.category}
+                  onChange={e => {
+                    const category = e.target.value
+                    setEditing({
+                      ...editing,
+                      category,
+                      allowAddOn: isAddOnCategory(category) ? false : editing.allowAddOn,
+                      targetCategories: isAddOnCategory(category) ? (editing.targetCategories ?? []) : undefined,
+                    })
+                  }}
+                >
                   {!categories.length && <option value="">No categories</option>}
                   {categories.map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
                 </select>
               </label>
+              {isAddOnCategory(editing.category) ? (
+                <div className="full-span target-cats">
+                  <span>Targeted categories</span>
+                  <div className="order-addon-list">
+                    {categories.filter(c => !isAddOnCategory(c.name)).map(c => {
+                      const checked = (editing.targetCategories ?? []).includes(c.name)
+                      return (
+                        <label key={c.id} className="check order-addon-check">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => {
+                              const current = new Set(editing.targetCategories ?? [])
+                              if (current.has(c.name)) current.delete(c.name)
+                              else current.add(c.name)
+                              setEditing({ ...editing, targetCategories: [...current] })
+                            }}
+                          />
+                          {c.name}
+                        </label>
+                      )
+                    })}
+                  </div>
+                  <span className="field-hint">This add-on is offered on items in the selected categories.</span>
+                </div>
+              ) : null}
               <label>Selling price{company.vatRegistered ? <span className="field-hint">VAT incl.</span> : null}<input name="sellingPrice" type="number" min={0} step="0.01" value={editing.sellingPrice} onChange={e => setEditing({ ...editing, sellingPrice: Number(e.target.value) })} required /></label>
               <label>Manufactured price{company.vatRegistered ? <span className="field-hint">VAT incl.</span> : null}<input name="manufacturedPrice" type="number" min={0} step="0.01" value={editing.manufacturedPrice} onChange={e => setEditing({ ...editing, manufacturedPrice: Number(e.target.value) })} required /></label>
               <div className="full-span coeff-preview">
@@ -1228,12 +1331,15 @@ function MenuPage({ menu, setMenu, categories, company, toast, tenantId }: { men
                 <strong>{formatProfitCoefficient(editing.sellingPrice, editing.manufacturedPrice)}</strong>
                 <span className="muted">Selling ÷ manufactured</span>
               </div>
-              <label className="check"><input name="allowAddOn" type="checkbox" defaultChecked={editing.allowAddOn} /> Allow add-on</label>
+              {!isAddOnCategory(editing.category) ? (
+                <label className="check"><input name="allowAddOn" type="checkbox" defaultChecked={editing.allowAddOn} /> Allow add-on</label>
+              ) : null}
               <label className="check"><input name="day" type="checkbox" defaultChecked={editing.day} /> Day</label>
               <label className="check"><input name="night" type="checkbox" defaultChecked={editing.night} /> Night</label>
               <label className="check"><input name="happyHour" type="checkbox" defaultChecked={editing.happyHour} /> Happy hour</label>
             </div>
-            <FormActions close={() => setEditing(null)} onDelete={editing.id ? () => setPendingDelete(editing) : undefined} />
+            {formError ? <p className="form-error">{formError}</p> : null}
+            <FormActions close={() => { setFormError(''); setEditing(null) }} onDelete={editing.id ? () => setPendingDelete(editing) : undefined} />
           </form>
         </Dialog>
       )}
@@ -1249,7 +1355,7 @@ function MenuPage({ menu, setMenu, categories, company, toast, tenantId }: { men
   )
 }
 
-function Tables({ tables, setTables, toast, tenantId }: { tables: DiningTable[]; setTables: React.Dispatch<React.SetStateAction<DiningTable[]>>; toast: (x: string) => void; tenantId: string | null }) {
+function Tables({ tables, setTables, toast, tenantId, onMutated }: { tables: DiningTable[]; setTables: React.Dispatch<React.SetStateAction<DiningTable[]>>; toast: (x: string) => void; tenantId: string | null; onMutated?: () => Promise<void> }) {
   const [editing, setEditing] = useState<DiningTable | null>(null)
   const [pendingDelete, setPendingDelete] = useState<DiningTable | null>(null)
   const [query, setQuery] = useState('')
@@ -1274,6 +1380,7 @@ function Tables({ tables, setTables, toast, tenantId }: { tables: DiningTable[];
       setTables(xs => editing.id ? xs.map(x => x.id === editing.id ? table : x) : [...xs, table].sort((a, b) => a.number - b.number))
       setEditing(null)
       toast(editing.id ? 'Table updated' : 'Table added')
+      await onMutated?.()
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not save table')
     }
@@ -1286,6 +1393,7 @@ function Tables({ tables, setTables, toast, tenantId }: { tables: DiningTable[];
       setPendingDelete(null)
       setEditing(null)
       toast('Table deleted')
+      await onMutated?.()
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not delete table')
     }
@@ -1360,12 +1468,14 @@ function Orders({
   const [query, setQuery] = useState('')
   const [statusFilter, setStatusFilter] = useState<'All' | OrderStatus>('All')
 
+  const orderableMenu = menu.filter(m => !isAddOnCategory(m.category))
+  const defaultItem = orderableMenu[0]
   const blankLine = (): OrderLine => ({
     id: newId(),
-    menuItemId: menu[0]?.id ?? null,
-    name: menu[0]?.name ?? '',
+    menuItemId: defaultItem?.id ?? null,
+    name: defaultItem?.name ?? '',
     qty: 1,
-    unitPrice: menu[0]?.sellingPrice ?? 0,
+    unitPrice: defaultItem?.sellingPrice ?? 0,
     addOns: [],
   })
   const blank = (): Order => ({
@@ -1375,6 +1485,8 @@ function Orders({
     status: 'New',
     paymentMethod: 'cash',
     lines: [blankLine()],
+    subtotal: 0,
+    discount: 0,
     total: 0,
     time: new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
     date: new Date().toISOString().slice(0, 10),
@@ -1464,6 +1576,10 @@ function Orders({
       }))
       .filter(line => line.name && line.qty > 0)
     if (!lines.length) return toast('Add at least one menu item')
+    const rawDiscount = Number(editing.discount) || 0
+    const amounts = settleOrderAmounts({ lines, discount: rawDiscount })
+    if (rawDiscount < 0) return toast('Discount cannot be negative')
+    if (rawDiscount > amounts.subtotal) return toast('Discount cannot exceed subtotal')
     const draft: Order = {
       id: editing.id || `#${1050 + orders.length}`,
       clientName: String(d.get('clientName')).trim() || 'Walk-in guest',
@@ -1471,7 +1587,9 @@ function Orders({
       status: d.get('status') as OrderStatus,
       paymentMethod: (String(d.get('paymentMethod') || 'cash') as PayMethod),
       lines,
-      total: lines.reduce((sum, line) => sum + orderLineTotal(line), 0),
+      subtotal: amounts.subtotal,
+      discount: amounts.discount,
+      total: amounts.total,
       time: editing.time || new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
       date: String(d.get('date') || new Date().toISOString().slice(0, 10)),
     }
@@ -1498,7 +1616,10 @@ function Orders({
     }
   }
 
-  const editingTotal = editing ? orderTotal(editing) : 0
+  const editingAmounts = editing ? settleOrderAmounts(editing) : { subtotal: 0, discount: 0, total: 0 }
+  const editingSubtotal = editingAmounts.subtotal
+  const editingDiscount = editingAmounts.discount
+  const editingTotal = editingAmounts.total
 
   return (
     <div className="page-content">
@@ -1533,7 +1654,7 @@ function Orders({
                 <th>Items</th>
                 <th>Status</th>
                 <th>Paid by</th>
-                <th className="align-right">Total{company.vatRegistered ? ' · VAT incl.' : ''}</th>
+                <th className="align-right">Amount{company.vatRegistered ? ' · VAT incl.' : ''}</th>
                 <th />
               </tr>
             </thead>
@@ -1574,7 +1695,9 @@ function Orders({
                     </div>
                   </td>
                   <td className="muted">{order.paymentMethod || 'cash'}</td>
-                  <td className="align-right"><strong>{money(order.total)}</strong></td>
+                  <td className="align-right">
+                    <OrderAmountsCell order={order} />
+                  </td>
                   <td>
                     <div className="row-actions">
                       <button className="more-button" onClick={() => setEditing({ ...order, lines: order.lines.map(l => ({ ...l, addOns: l.addOns.map(a => ({ ...a })) })) })} aria-label={`Edit ${order.id}`}><MoreHorizontal size={18} /></button>
@@ -1617,7 +1740,11 @@ function Orders({
                 {editing.lines.map((line, index) => {
                   const menuItem = menu.find(m => m.id === line.menuItemId)
                   const allowAddOn = menuItem?.allowAddOn ?? false
-                  const addOnOptions = menu.filter(m => m.id !== line.menuItemId)
+                  const addOnOptions = menu.filter(m =>
+                    isAddOnCategory(m.category) &&
+                    !!menuItem?.category &&
+                    m.targetCategories?.includes(menuItem.category)
+                  )
                   return (
                     <div className="order-line-block" key={line.id}>
                       <div className="order-line-row">
@@ -1631,7 +1758,10 @@ function Orders({
                             {line.menuItemId && !menu.some(m => m.id === line.menuItemId) && (
                               <option value={line.menuItemId}>{line.name}</option>
                             )}
-                            {menu.map(m => <option key={m.id} value={m.id}>{m.name} · {money(m.sellingPrice)}</option>)}
+                            {orderableMenu.map(m => <option key={m.id} value={m.id}>{m.name} · {money(m.sellingPrice)}</option>)}
+                            {line.menuItemId && isAddOnCategory(menuItem?.category ?? '') && (
+                              <option value={line.menuItemId}>{line.name}</option>
+                            )}
                           </select>
                         </label>
                         <label>Qty<input type="number" min={1} step={1} value={line.qty} onChange={e => updateLine(line.id, { qty: Number(e.target.value) })} required /></label>
@@ -1654,14 +1784,34 @@ function Orders({
                                   {option.name} · {money(option.sellingPrice)}
                                 </label>
                               )
-                            }) : <span className="muted">No other menu items available as add-ons.</span>}
+                            }) : <span className="muted">No add-ons set for this category.</span>}
                           </div>
                         </div>
                       )}
                     </div>
                   )
                 })}
-                <div className="line-items-total"><span className="muted">Order total{company.vatRegistered ? ' (VAT incl.)' : ''}</span><strong>{money(editingTotal)}</strong></div>
+                <div className="order-totals">
+                  <div className="line-items-total"><span className="muted">Subtotal{company.vatRegistered ? ' (VAT incl.)' : ''}</span><strong>{money(editingSubtotal)}</strong></div>
+                  <label className="order-discount-row">
+                    <span>Discount{company.vatRegistered ? <span className="field-hint">VAT incl. · ≤ subtotal</span> : <span className="field-hint">≤ subtotal</span>}</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={editingSubtotal}
+                      step="0.01"
+                      value={editingDiscount}
+                      onChange={e => setEditing({
+                        ...editing,
+                        discount: Math.min(Math.max(Number(e.target.value) || 0, 0), editingSubtotal),
+                      })}
+                    />
+                  </label>
+                  {editingDiscount > 0 && (
+                    <div className="line-items-total muted-total"><span className="muted">Less discount</span><strong>−{money(editingDiscount)}</strong></div>
+                  )}
+                  <div className="line-items-total"><span className="muted">Total due{company.vatRegistered ? ' (VAT incl.)' : ''}</span><strong>{money(editingTotal)}</strong></div>
+                </div>
               </div>
             </div>
             <FormActions close={() => setEditing(null)} onDelete={editing.id ? () => setPendingDelete(editing) : undefined} />
@@ -1928,6 +2078,8 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
   const billable = filtered.filter(o => o.status === 'Completed')
   const cancelled = filtered.filter(o => o.status === 'Cancelled')
   const salesTotal = billable.reduce((sum, o) => sum + o.total, 0)
+  const discountsTotal = billable.reduce((sum, o) => sum + orderDiscountAmount(o), 0)
+  const beforeDiscountTotal = billable.reduce((sum, o) => sum + settleOrderAmounts(o).subtotal, 0)
   const salesVat = vatSplit(salesTotal, vatOn)
   const cancelledTotal = cancelled.reduce((sum, o) => sum + o.total, 0)
   const avgTicket = billable.length ? salesTotal / billable.length : 0
@@ -1939,11 +2091,12 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
   }
 
   const itemBreakdown = billable.reduce<Record<string, { qty: number; revenue: number }>>((acc, order) => {
+    const factor = orderDiscountFactor(order)
     order.lines.forEach(line => {
       const name = line.name.trim() || 'Untitled'
       if (!acc[name]) acc[name] = { qty: 0, revenue: 0 }
       acc[name].qty += Number(line.qty) || 0
-      acc[name].revenue += orderLineTotal(line)
+      acc[name].revenue += orderLineTotal(line) * factor
     })
     return acc
   }, {})
@@ -1994,7 +2147,11 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
         filename: reportFileName('sales-report'),
         orientation: 'landscape',
         kpis: [
-          { label: vatOn ? 'Gross sales (VAT incl.)' : 'Gross sales', value: money(salesTotal) },
+          { label: vatOn ? 'Net sales (VAT incl.)' : 'Net sales', value: money(salesTotal) },
+          ...(discountsTotal > 0 ? [
+            { label: 'Before discount', value: money(beforeDiscountTotal) },
+            { label: 'Discounts', value: money(discountsTotal) },
+          ] : []),
           ...(vatOn ? [{ label: 'VAT on sales', value: money(salesVat.vat) }, { label: 'Excl. VAT', value: money(salesVat.exclusive) }] : []),
           { label: 'Orders', value: String(billable.length) },
           { label: 'Avg ticket', value: money(avgTicket) },
@@ -2005,18 +2162,23 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
           {
             title: 'Orders',
             head: vatOn
-              ? ['Order', 'Date', 'Client', 'Table', 'Status', 'Excl. VAT', 'VAT', 'Incl. VAT']
-              : ['Order', 'Date', 'Client', 'Table', 'Status', 'Total'],
-            rightAlign: vatOn ? [5, 6, 7] : [5],
-            body: filtered.map(order => [
-              order.id,
-              `${formatExpenseDate(order.date)} ${order.time}`,
-              order.clientName || 'Walk-in guest',
-              order.tableNumber,
-              order.status,
-              ...vatPdfCells(order.total, vatOn),
-            ]),
-            foot: ['Total completed', '', '', '', '', ...vatPdfCells(salesTotal, vatOn)],
+              ? ['Order', 'Date', 'Client', 'Table', 'Status', 'Subtotal', 'Discount', 'Excl. VAT', 'VAT', 'Incl. VAT']
+              : ['Order', 'Date', 'Client', 'Table', 'Status', 'Subtotal', 'Discount', 'Total'],
+            rightAlign: vatOn ? [5, 6, 7, 8, 9] : [5, 6, 7],
+            body: filtered.map(order => {
+              const amounts = settleOrderAmounts(order)
+              return [
+                order.id,
+                `${formatExpenseDate(order.date)} ${order.time}`,
+                order.clientName || 'Walk-in guest',
+                order.tableNumber,
+                order.status,
+                money(amounts.subtotal),
+                amounts.discount ? `-${money(amounts.discount)}` : '-',
+                ...vatPdfCells(order.total, vatOn),
+              ]
+            }),
+            foot: ['Total completed', '', '', '', '', money(beforeDiscountTotal), discountsTotal ? `-${money(discountsTotal)}` : '-', ...vatPdfCells(salesTotal, vatOn)],
           },
           {
             title: 'By item',
@@ -2038,7 +2200,8 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
           company.vatRegistered
             ? `Amounts are VAT inclusive at ${Math.round(VAT_RATE * 100)}%. Excl. VAT = inclusive / 1.${Math.round(VAT_RATE * 100)}.`
             : 'The company is not VAT registered.',
-          'Cancelled orders are listed when you choose that status, but gross sales only include completed tickets.',
+          'Cancelled orders are listed when you choose that status, but net sales only include completed tickets.',
+          'Net sales are total_amount (after discount). VAT is calculated on the collected amount.',
         ],
       })
       toast('Sales report PDF downloaded')
@@ -2085,9 +2248,21 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
 
       <div className="sales-summary">
         <div className="sales-kpi">
-          <span>Gross sales{vatOn ? ' · VAT incl.' : ''}</span>
+          <span>Net sales{vatOn ? ' · VAT incl.' : ''}</span>
           <strong>{money(salesTotal)}</strong>
         </div>
+        {discountsTotal > 0 && (
+          <div className="sales-kpi">
+            <span>Before discount{vatOn ? ' · VAT incl.' : ''}</span>
+            <strong>{money(beforeDiscountTotal)}</strong>
+          </div>
+        )}
+        {discountsTotal > 0 && (
+          <div className="sales-kpi">
+            <span>Discounts{vatOn ? ' · VAT incl.' : ''}</span>
+            <strong>−{money(discountsTotal)}</strong>
+          </div>
+        )}
         {vatOn && (
           <div className="sales-kpi">
             <span>VAT on sales</span>
@@ -2138,6 +2313,8 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
                   <th>Table</th>
                   <th>Items</th>
                   <th>Status</th>
+                  <th className="align-right">Subtotal</th>
+                  <th className="align-right">Discount</th>
                   {vatOn ? (
                     <>
                       <th className="align-right">Excl. VAT</th>
@@ -2150,7 +2327,9 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
                 </tr>
               </thead>
               <tbody>
-                {ordersPaged.slice.map(order => (
+                {ordersPaged.slice.map(order => {
+                  const amounts = settleOrderAmounts(order)
+                  return (
                   <tr key={order.id}>
                     <td>
                       <strong>{order.id}</strong>
@@ -2169,15 +2348,20 @@ function SalesReport({ orders, company, toast }: { orders: Order[]; company: Com
                         {order.status}
                       </span>
                     </td>
+                    <td className="align-right">{money(amounts.subtotal)}</td>
+                    <td className="align-right">{amounts.discount ? `−${money(amounts.discount)}` : '—'}</td>
                     <VatAmountCells inclusive={order.total} vatOn={vatOn} />
                   </tr>
-                ))}
-                {!filtered.length && <tr><td colSpan={vatOn ? 8 : 6} className="muted">No orders match these filters.</td></tr>}
+                  )
+                })}
+                {!filtered.length && <tr><td colSpan={vatOn ? 10 : 8} className="muted">No orders match these filters.</td></tr>}
               </tbody>
               {!!filtered.length && (
                 <tfoot>
                   <tr>
                     <td colSpan={5}><strong>Total completed</strong></td>
+                    <td className="align-right"><strong>{money(beforeDiscountTotal)}</strong></td>
+                    <td className="align-right"><strong>{discountsTotal ? `−${money(discountsTotal)}` : '—'}</strong></td>
                     <VatAmountCells inclusive={salesTotal} vatOn={vatOn} />
                   </tr>
                 </tfoot>
@@ -2637,11 +2821,12 @@ function InventoryReport({ orders, menu, company, toast }: { orders: Order[]; me
 
   type SoldRow = { name: string; category: string; qty: number; revenue: number; orders: number; addOn: boolean }
   const soldMap = completedInRange.reduce<Record<string, SoldRow & { orderIds: Set<string> }>>((acc, order) => {
+    const factor = orderDiscountFactor(order)
     order.lines.forEach(line => {
       const name = line.name.trim() || 'Untitled'
       const category = resolveCategory(name, line.menuItemId)
       const qty = Number(line.qty) || 0
-      const lineRevenue = qty * (Number(line.unitPrice) || 0)
+      const lineRevenue = qty * (Number(line.unitPrice) || 0) * factor
       const key = `item::${name}`
       if (!acc[key]) acc[key] = { name, category, qty: 0, revenue: 0, orders: 0, addOn: false, orderIds: new Set() }
       acc[key].qty += qty
@@ -2653,7 +2838,7 @@ function InventoryReport({ orders, menu, company, toast }: { orders: Order[]; me
         const addOnKey = `addon::${addOnName}`
         if (!acc[addOnKey]) acc[addOnKey] = { name: addOnName, category: addOnCategory, qty: 0, revenue: 0, orders: 0, addOn: true, orderIds: new Set() }
         acc[addOnKey].qty += qty
-        acc[addOnKey].revenue += qty * (Number(addOn.price) || 0)
+        acc[addOnKey].revenue += qty * (Number(addOn.price) || 0) * factor
         acc[addOnKey].orderIds.add(order.id)
       })
     })
@@ -3010,7 +3195,11 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
   const periodExpenses = expenses.filter(e => inPeriod(e.date))
   const periodPurchases = purchases.filter(p => inPeriod(p.date))
 
+  const periodGross = periodOrders.reduce((sum, o) => sum + orderSubtotal(o), 0)
+  const periodDiscount = periodOrders.reduce((sum, o) => sum + orderDiscountAmount(o), 0)
   const revenue = salesPnl(sumOrders(periodOrders))
+  const revenueBeforeDiscount = salesPnl(periodGross)
+  const discountsPnl = salesPnl(periodDiscount)
   const expensesByCategory = periodExpenses.reduce<Record<string, PnlParts>>((acc, e) => {
     acc[e.category] = addPnl(acc[e.category] || emptyPnl(), expensePnl(e, vatOn))
     return acc
@@ -3110,6 +3299,10 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
     setDownloading(true)
     try {
       const pnlBody = [
+        ...(periodDiscount > 0 ? [
+          pnlRow('Revenue before discounts', revenueBeforeDiscount),
+          pnlRow('Less: sales discounts', negPnl(discountsPnl), { indent: true }),
+        ] : []),
         pnlRow('Revenue (from restaurant orders)', revenue),
         pnlRow('Cost of sales', negPnl(costOfSales)),
         ...(cogsLines.length ? cogsLines.map(([cat, parts]) => pnlRow(String(cat), negPnl(parts), { indent: true })) : [pnlRow('No cost-of-sales purchases recorded in period', emptyPnl(), { indent: true })]),
@@ -3145,7 +3338,7 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
           },
         ],
         notes: [
-          `Revenue is taken from restaurant orders. Expenses and purchases follow each bill’s VAT inclusive/exclusive and claimable settings.`,
+          `Revenue is taken from completed restaurant orders, net of till discounts. VAT is on the amount collected. Expenses and purchases follow each bill’s VAT inclusive/exclusive and claimable settings.`,
           ...(vatOn ? [`VAT is calculated at the standard Mauritius rate of ${Math.round(VAT_RATE * 100)}%. Only claimable input VAT is stripped from the trading result.`] : []),
           'Cost of sales aggregates purchases of goods plus Produce, Meat & seafood, Dairy, Dry goods, Beverages, Alcohol, and Packaging.',
           'Operating expenses are classified by function (distribution, administrative, and other).',
@@ -3210,6 +3403,8 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
               </tr>
             </thead>
             <tbody>
+              {periodDiscount > 0 && row('Revenue before discounts', revenueBeforeDiscount, { muted: true })}
+              {periodDiscount > 0 && row('Less: sales discounts', negPnl(discountsPnl), { key: 'sales-discounts', indent: true, muted: true })}
               {row('Revenue (from restaurant orders)', revenue, { bold: true })}
               {row('Cost of sales', negPnl(costOfSales), { bold: true })}
               {cogsLines.map(([cat, parts]) => row(String(cat), negPnl(parts), { key: `cogs-${cat}`, indent: true, muted: true }))}
@@ -3245,7 +3440,7 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
         <div className="pnl-notes">
           <h3>Notes</h3>
           <ol>
-            <li>Revenue is taken from completed restaurant orders. Expenses and purchases use each bill’s VAT inclusive / exclusive and claimable flags.</li>
+            <li>Revenue is taken from completed restaurant orders, net of till discounts. VAT is calculated on the amount collected. Expenses and purchases use each bill’s VAT inclusive / exclusive and claimable flags.</li>
             {vatOn && <li>VAT is calculated at the standard Mauritius rate of {Math.round(VAT_RATE * 100)}%. Claimable input VAT is shown in the VAT column and excluded from the trading result. Bills marked not claimable keep VAT inside the expense.</li>}
             <li>Cost of sales aggregates purchases of goods plus Produce, Meat &amp; seafood, Dairy, Dry goods, Beverages, Alcohol, and Packaging.</li>
             <li>Operating expenses are classified by function under IFRS for SMEs (distribution, administrative, and other).</li>
@@ -3265,7 +3460,7 @@ function Reports({ orders, expenses, purchases = [], company, toast }: { orders:
   )
 }
 
-function SettingsPage({ company, setCompany, toast, tenantId }: { company: CompanySettings; setCompany: React.Dispatch<React.SetStateAction<CompanySettings>>; toast: (x: string) => void; tenantId: string | null }) {
+function SettingsPage({ company, setCompany, toast, tenantId, onMutated }: { company: CompanySettings; setCompany: React.Dispatch<React.SetStateAction<CompanySettings>>; toast: (x: string) => void; tenantId: string | null; onMutated?: () => Promise<void> }) {
   const [draft, setDraft] = useState(company)
   useEffect(() => { setDraft(company) }, [company])
 
@@ -3297,6 +3492,7 @@ function SettingsPage({ company, setCompany, toast, tenantId }: { company: Compa
       const saved = tenantId ? await api.updateCompany(tenantId, next) : next
       setCompany(saved)
       toast('Company settings saved')
+      await onMutated?.()
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not save settings')
     }
@@ -3368,20 +3564,22 @@ export default function BackOfficeApp({ children }: { children?: React.ReactNode
   const router = useRouter()
   const matched = pageFromPath(pathname) ?? 'dashboard'
   const active = matched
-  const [auth, setAuth] = useState(false)
-  const [booting, setBooting] = useState(true)
+  const cached = getWorkspaceSnapshot()
+  const [auth, setAuth] = useState(() => cached?.auth ?? false)
+  const [booting, setBooting] = useState(() => !cached)
   const [drawer, setDrawer] = useState(false)
   const [confirmLogout, setConfirmLogout] = useState(false)
   const [toastMessage, setToastMessage] = useState('')
-  const [tenantId, setTenantId] = useState<string | null>(null)
-  const [expenseCategoryMap, setExpenseCategoryMap] = useState<Map<string, string>>(new Map())
-  const [menu, setMenu] = useState(seedMenu)
-  const [tables, setTables] = useState(seedTables)
-  const [orders, setOrders] = useState(seedOrders)
-  const [expenses, setExpenses] = useState(seedExpenses)
-  const [categories, setCategories] = useState(seedCategories)
-  const [company, setCompany] = useState(seedCompany)
-  const [books, setBooks] = useState<AccountingBooks>(() => emptyBooks())
+  const [tenantId, setTenantId] = useState<string | null>(() => cached?.tenantId ?? null)
+  const [expenseCategoryMap, setExpenseCategoryMap] = useState<Map<string, string>>(() => cached?.expenseCategoryMap ?? new Map())
+  const [menu, setMenu] = useState(() => cached?.menu ?? seedMenu)
+  const [tables, setTables] = useState(() => cached?.tables ?? seedTables)
+  const [orders, setOrders] = useState(() => cached?.orders ?? seedOrders)
+  const [expenses, setExpenses] = useState(() => cached?.expenses ?? seedExpenses)
+  const [categories, setCategories] = useState(() => cached?.categories ?? seedCategories)
+  const [company, setCompany] = useState(() => cached?.company ?? seedCompany)
+  const [books, setBooks] = useState<AccountingBooks>(() => cached?.books ?? emptyBooks())
+  const loadRemoteRef = useRef<(userId: string) => Promise<void>>(async () => {})
 
   const toast = (message: string) => {
     setToastMessage(message)
@@ -3398,6 +3596,11 @@ export default function BackOfficeApp({ children }: { children?: React.ReactNode
         description: String(row.description ?? row.recipe ?? ''),
         category: String(row.category ?? row.cat ?? ''),
         allowAddOn: Boolean(row.allowAddOn ?? false),
+        targetCategories: Array.isArray(row.targetCategories)
+          ? row.targetCategories.map(name => String(name))
+          : typeof row.targetCategory === 'string' && row.targetCategory
+            ? [row.targetCategory]
+            : undefined,
         sellingPrice: Number(row.sellingPrice ?? row.price ?? 0),
         manufacturedPrice: Number(row.manufacturedPrice ?? row.cost ?? 0),
         day: Boolean(row.day ?? true),
@@ -3476,14 +3679,18 @@ export default function BackOfficeApp({ children }: { children?: React.ReactNode
       setBooks(emptyBooks())
       toast('Accounting is not installed yet. Run supabase/04-accounting.sql in Supabase.')
     }
+    markWorkspaceFetched(pathname)
   }
 
-  const reloadBooks = async () => {
-    if (!tenantId) return
+  loadRemoteRef.current = loadRemote
+
+  const refreshWorkspace = async () => {
+    if (!isSupabaseConfigured) return
     try {
-      setBooks(await booksApi.loadBooks(tenantId))
+      const session = await api.getSession()
+      if (session?.user) await loadRemoteRef.current(session.user.id)
     } catch (err) {
-      toast(err instanceof Error ? err.message : 'Could not reload the ledger')
+      console.error(err)
     }
   }
 
@@ -3491,7 +3698,7 @@ export default function BackOfficeApp({ children }: { children?: React.ReactNode
     try {
       if (tenantId) {
         await booksApi.postSaleJournal(tenantId, books.accounts, books.journals, order, company.vatRegistered)
-        await reloadBooks()
+        await refreshWorkspace()
         return
       }
       setBooks(prev => {
@@ -3509,14 +3716,14 @@ export default function BackOfficeApp({ children }: { children?: React.ReactNode
       if (deletedId) {
         if (tenantId) await booksApi.deleteAutoJournal(tenantId, 'expense', deletedId)
         setBooks(prev => removeJournal(prev, 'expense', deletedId))
-        if (tenantId) await reloadBooks()
+        await refreshWorkspace()
         return
       }
       if (!expense) return
       const code = expenseAccountCode(expense.category, cogsExpenseCategories, distributionExpenseCategories, adminExpenseCategories)
       if (tenantId) {
         await booksApi.postExpenseJournal(tenantId, books.accounts, books.journals, expense, company.vatRegistered, code)
-        await reloadBooks()
+        await refreshWorkspace()
         return
       }
       const draft = buildExpenseJournal(books.accounts, expense, company.vatRegistered, code)
@@ -3529,20 +3736,45 @@ export default function BackOfficeApp({ children }: { children?: React.ReactNode
     }
   }
 
+  useLayoutEffect(() => {
+    if (booting) return
+    setWorkspaceSnapshot({
+      auth,
+      tenantId,
+      menu,
+      tables,
+      orders,
+      expenses,
+      categories,
+      company,
+      books,
+      expenseCategoryMap,
+    })
+  }, [booting, auth, tenantId, menu, tables, orders, expenses, categories, company, books, expenseCategoryMap])
+
   useEffect(() => {
     let alive = true
     ;(async () => {
       try {
         if (!isSupabaseConfigured) {
-          setAuth(!!localStorage.getItem('lagoon-auth'))
-          hydrateLocal()
+          if (!getWorkspaceSnapshot()?.auth) {
+            setAuth(!!localStorage.getItem('lagoon-auth'))
+            hydrateLocal()
+          }
           return
         }
         const session = await api.getSession()
         if (!alive) return
         if (session?.user) {
-          await loadRemote(session.user.id)
-          if (alive) setAuth(true)
+          if (getWorkspaceSnapshot()?.auth) {
+            setAuth(true)
+          } else {
+            await loadRemoteRef.current(session.user.id)
+            if (alive) setAuth(true)
+          }
+        } else {
+          setWorkspaceSnapshot(null)
+          setAuth(false)
         }
       } catch (err) {
         console.error(err)
@@ -3553,6 +3785,38 @@ export default function BackOfficeApp({ children }: { children?: React.ReactNode
     })()
     return () => { alive = false }
   }, [])
+
+  useEffect(() => {
+    if (!auth || booting || !isSupabaseConfigured) return
+    let alive = true
+    ;(async () => {
+      try {
+        const session = await api.getSession()
+        if (!alive || !session?.user) return
+        await loadRemoteRef.current(session.user.id)
+      } catch (err) {
+        console.error(err)
+      }
+    })()
+    return () => { alive = false }
+  }, [pathname, auth, booting])
+
+  useEffect(() => {
+    if (!auth || !isSupabaseConfigured) return
+    const refresh = () => {
+      if (document.visibilityState === 'hidden') return
+      clearWorkspaceFetchMark()
+      void api.getSession().then(session => {
+        if (session?.user) return loadRemoteRef.current(session.user.id)
+      }).catch(err => console.error(err))
+    }
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', refresh)
+    return () => {
+      window.removeEventListener('focus', refresh)
+      document.removeEventListener('visibilitychange', refresh)
+    }
+  }, [auth])
 
   useEffect(() => {
     if (!auth || isSupabaseConfigured) return
@@ -3599,6 +3863,7 @@ export default function BackOfficeApp({ children }: { children?: React.ReactNode
   const handleLogout = async () => {
     if (isSupabaseConfigured) await api.signOut()
     localStorage.removeItem('lagoon-auth')
+    setWorkspaceSnapshot(null)
     setTenantId(null)
     setConfirmLogout(false)
     setAuth(false)
@@ -3617,20 +3882,20 @@ export default function BackOfficeApp({ children }: { children?: React.ReactNode
       <div className="main-area">
         <Header active={matched} mobileMenu={() => setDrawer(!drawer)} />
         {matched === 'dashboard' && <Dashboard orders={orders} expenses={expenses} vatOn={company.vatRegistered} purchaseAmounts={books.purchases.map(item => ({ date: item.date, amount: documentVat(purchaseTotal(item), item, company.vatRegistered).payable }))} />}
-        {matched === 'menu' && <MenuPage menu={menu} setMenu={setMenu} categories={categories} company={company} toast={toast} tenantId={tenantId} />}
-        {matched === 'categories' && <CategoriesPage categories={categories} setCategories={setCategories} toast={toast} tenantId={tenantId} />}
-        {matched === 'tables' && <Tables tables={tables} setTables={setTables} toast={toast} tenantId={tenantId} />}
+        {matched === 'menu' && <MenuPage menu={menu} setMenu={setMenu} categories={categories} company={company} toast={toast} tenantId={tenantId} onMutated={refreshWorkspace} />}
+        {matched === 'categories' && <CategoriesPage categories={categories} setCategories={setCategories} toast={toast} tenantId={tenantId} onMutated={refreshWorkspace} />}
+        {matched === 'tables' && <Tables tables={tables} setTables={setTables} toast={toast} tenantId={tenantId} onMutated={refreshWorkspace} />}
         {matched === 'orders' && <Orders orders={orders} setOrders={setOrders} menu={menu} company={company} toast={toast} tenantId={tenantId} onPosted={postSale} />}
         {matched === 'expenses' && <Expenses expenses={expenses} setExpenses={setExpenses} company={company} toast={toast} tenantId={tenantId} expenseCategoryMap={expenseCategoryMap} onPosted={postExpense} />}
-        {matched === 'purchases' && <PurchasesPage books={books} setBooks={setBooks} tenantId={tenantId} vatOn={company.vatRegistered} toast={toast} reload={reloadBooks} />}
-        {matched === 'journals' && <JournalsPage books={books} setBooks={setBooks} tenantId={tenantId} vatOn={company.vatRegistered} toast={toast} reload={reloadBooks} />}
-        {matched === 'ledger' && <LedgerPage books={books} />}
-        {matched === 'cashbook' && <CashBookPage books={books} />}
+        {matched === 'purchases' && <PurchasesPage books={books} setBooks={setBooks} tenantId={tenantId} vatOn={company.vatRegistered} toast={toast} reload={refreshWorkspace} company={company} />}
+        {matched === 'journals' && <JournalsPage books={books} setBooks={setBooks} tenantId={tenantId} vatOn={company.vatRegistered} toast={toast} reload={refreshWorkspace} />}
+        {matched === 'ledger' && <LedgerPage books={books} company={company} toast={toast} />}
+        {matched === 'cashbook' && <CashBookPage books={books} company={company} toast={toast} />}
         {matched === 'pnl' && <Reports orders={orders} expenses={expenses} purchases={books.purchases} company={company} toast={toast} />}
         {matched === 'sales' && <SalesReport orders={orders} company={company} toast={toast} />}
         {matched === 'expense-report' && <ExpenseReport expenses={expenses} company={company} toast={toast} />}
         {matched === 'inventory-report' && <InventoryReport orders={orders} menu={menu} company={company} toast={toast} />}
-        {matched === 'settings' && <SettingsPage company={company} setCompany={setCompany} toast={toast} tenantId={tenantId} />}
+        {matched === 'settings' && <SettingsPage company={company} setCompany={setCompany} toast={toast} tenantId={tenantId} onMutated={refreshWorkspace} />}
       </div>
       {confirmLogout && (
         <ConfirmDelete

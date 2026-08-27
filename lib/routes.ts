@@ -45,7 +45,7 @@ export const PAGE_TITLES: Record<PageKey, [string, string]> = {
   orders: ['Orders', 'Tickets with menu items, add-ons, table, and status.'],
   expenses: ['Expenses', 'Track the cost of doing good work.'],
   purchases: ['Purchases of goods', 'Supplier invoices paid from cash or bank.'],
-  journals: ['Journal entries', 'Automatic postings and manual journals into the ledger.'],
+  journals: ['Journal entries', 'Chart of accounts and postings into the ledger.'],
   ledger: ['General ledger', 'Trial balance and account movements.'],
   cashbook: ['Cash book', 'Cash on hand and bank.'],
   pnl: ['P&L', 'Mauritian profit and loss statement from orders and expenses.'],

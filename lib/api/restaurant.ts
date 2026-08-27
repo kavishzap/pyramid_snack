@@ -7,6 +7,9 @@ import {
   type MenuItem,
   type Order,
   type OrderLine,
+  isAddOnCategory,
+  orderLineAmount,
+  settleOrderAmounts,
   orderStatusFromDb,
   orderStatusToDb,
 } from '@/lib/domain'
@@ -23,11 +26,6 @@ type TenantRow = {
   vat_number: string
   logo_url: string
   is_active?: boolean
-}
-
-const lineTotal = (line: OrderLine) => {
-  const addOns = line.addOns.reduce((sum, a) => sum + (Number(a.price) || 0), 0)
-  return (Number(line.qty) || 0) * ((Number(line.unitPrice) || 0) + addOns)
 }
 
 export async function signIn(email: string, password: string) {
@@ -148,40 +146,79 @@ export async function deleteCategory(tenantId: string, id: string) {
   if (error) throw error
 }
 
+const MENU_ITEM_SELECT = '*, category:categories!category_id(name), menu_item_target_categories(categories!category_id(name))'
+
+function throwQueryError(error: { message?: string } | null) {
+  if (!error) return
+  throw new Error(error.message || 'Could not load menu items')
+}
+
+function mapMenuItem(row: Record<string, unknown>, fallbackCategory = ''): MenuItem {
+  const cat = row.category as { name?: string } | null
+  const links = Array.isArray(row.menu_item_target_categories) ? row.menu_item_target_categories as Array<Record<string, unknown>> : []
+  const category = String(cat?.name ?? fallbackCategory)
+  const targetCategories = links
+    .map(link => {
+      const target = (link.categories ?? link.category) as { name?: string } | null
+      return target?.name?.trim() || ''
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b))
+  return {
+    id: String(row.id),
+    name: String(row.name ?? ''),
+    description: String(row.description ?? ''),
+    category,
+    allowAddOn: Boolean(row.allow_add_on),
+    targetCategories: isAddOnCategory(category) && targetCategories.length ? targetCategories : undefined,
+    sellingPrice: Number(row.selling_price ?? 0),
+    manufacturedPrice: Number(row.manufactured_price ?? 0),
+    day: Boolean(row.available_day),
+    night: Boolean(row.available_night),
+    happyHour: Boolean(row.available_happy_hour),
+  }
+}
+
+async function replaceTargetCategories(tenantId: string, menuItemId: string, categoryIds: string[]) {
+  const supabase = getSupabase()
+  const { error: deleteError } = await supabase
+    .from('menu_item_target_categories')
+    .delete()
+    .eq('tenant_id', tenantId)
+    .eq('menu_item_id', menuItemId)
+  throwQueryError(deleteError)
+  if (!categoryIds.length) return
+  const { error } = await supabase.from('menu_item_target_categories').insert(
+    categoryIds.map(category_id => ({
+      tenant_id: tenantId,
+      menu_item_id: menuItemId,
+      category_id,
+    }))
+  )
+  throwQueryError(error)
+}
+
 export async function fetchMenu(tenantId: string): Promise<MenuItem[]> {
   const supabase = getSupabase()
   const { data, error } = await supabase
     .from('menu_items')
-    .select('*, categories(name)')
+    .select(MENU_ITEM_SELECT)
     .eq('tenant_id', tenantId)
     .eq('is_active', true)
     .order('name', { ascending: true })
-  if (error) throw error
-  return (data || []).map((row: Record<string, unknown>) => {
-    const cat = row.categories as { name?: string } | null
-    return {
-      id: String(row.id),
-      name: String(row.name ?? ''),
-      description: String(row.description ?? ''),
-      category: String(cat?.name ?? ''),
-      allowAddOn: Boolean(row.allow_add_on),
-      sellingPrice: Number(row.selling_price ?? 0),
-      manufacturedPrice: Number(row.manufactured_price ?? 0),
-      day: Boolean(row.available_day),
-      night: Boolean(row.available_night),
-      happyHour: Boolean(row.available_happy_hour),
-    }
-  })
+  throwQueryError(error)
+  return (data || []).map((row: Record<string, unknown>) => mapMenuItem(row))
 }
 
-export async function saveMenuItem(tenantId: string, item: MenuItem, categoryId: string | null): Promise<MenuItem> {
+export async function saveMenuItem(tenantId: string, item: MenuItem, categoryId: string | null, targetCategoryIds: string[] = []): Promise<MenuItem> {
   const supabase = getSupabase()
+  const addon = isAddOnCategory(item.category)
   const payload = {
     tenant_id: tenantId,
     category_id: categoryId,
     name: item.name,
     description: item.description,
-    allow_add_on: item.allowAddOn,
+    allow_add_on: addon ? false : item.allowAddOn,
     selling_price: item.sellingPrice,
     manufactured_price: item.manufacturedPrice,
     available_day: item.day,
@@ -189,37 +226,23 @@ export async function saveMenuItem(tenantId: string, item: MenuItem, categoryId:
     available_happy_hour: item.happyHour,
     is_active: true,
   }
-  if (item.id) {
-    const { data, error } = await supabase.from('menu_items').update(payload).eq('id', item.id).eq('tenant_id', tenantId).select('*, categories(name)').single()
-    if (error) throw error
-    const cat = data.categories as { name?: string } | null
-    return {
-      id: data.id,
-      name: data.name,
-      description: data.description || '',
-      category: cat?.name || item.category,
-      allowAddOn: data.allow_add_on,
-      sellingPrice: Number(data.selling_price),
-      manufacturedPrice: Number(data.manufactured_price),
-      day: data.available_day,
-      night: data.available_night,
-      happyHour: data.available_happy_hour,
-    }
-  }
-  const { data, error } = await supabase.from('menu_items').insert(payload).select('*, categories(name)').single()
-  if (error) throw error
-  const cat = data.categories as { name?: string } | null
+  const saved = item.id
+    ? await supabase.from('menu_items').update(payload).eq('id', item.id).eq('tenant_id', tenantId).select('id').single()
+    : await supabase.from('menu_items').insert(payload).select('id').single()
+  throwQueryError(saved.error)
+  const id = String((saved.data as { id: string }).id)
+  await replaceTargetCategories(tenantId, id, addon ? targetCategoryIds : [])
+  const { data: fresh, error: reloadError } = await supabase
+    .from('menu_items')
+    .select(MENU_ITEM_SELECT)
+    .eq('id', id)
+    .eq('tenant_id', tenantId)
+    .single()
+  if (!reloadError && fresh) return mapMenuItem(fresh as Record<string, unknown>, item.category)
   return {
-    id: data.id,
-    name: data.name,
-    description: data.description || '',
-    category: cat?.name || item.category,
-    allowAddOn: data.allow_add_on,
-    sellingPrice: Number(data.selling_price),
-    manufacturedPrice: Number(data.manufactured_price),
-    day: data.available_day,
-    night: data.available_night,
-    happyHour: data.available_happy_hour,
+    ...item,
+    id,
+    targetCategories: addon ? item.targetCategories : undefined,
   }
 }
 
@@ -300,13 +323,22 @@ export async function fetchOrders(tenantId: string): Promise<Order[]> {
         }
       })
     const time = String(row.order_time ?? '').slice(0, 5)
+    const discount = Number(row.discount_amount ?? 0)
+    const total = Number(row.total_amount ?? 0)
+    const storedSubtotal = row.subtotal_amount == null ? null : Number(row.subtotal_amount)
+    const subtotal =
+      storedSubtotal != null && Number.isFinite(storedSubtotal) && (storedSubtotal > 0 || !lines.length)
+        ? storedSubtotal
+        : settleOrderAmounts({ lines, discount, total }).subtotal
     return {
       id: String(row.order_number ?? row.id),
       clientName: String(row.client_name ?? 'Walk-in guest'),
       tableNumber: Number(row.table_number ?? 1),
       status: orderStatusFromDb(String(row.status ?? 'new')),
       lines,
-      total: Number(row.total_amount ?? 0),
+      subtotal,
+      discount,
+      total,
       time,
       date: String(row.order_date ?? ''),
       paymentMethod: row.payment_method === 'bank' || row.payment_method === 'credit' ? row.payment_method : 'cash',
@@ -318,7 +350,7 @@ export async function fetchOrders(tenantId: string): Promise<Order[]> {
 /** Map display order id (#1048) back to DB uuid via fetch cache helper */
 export async function saveOrder(tenantId: string, order: Order, dbId?: string | null): Promise<Order> {
   const supabase = getSupabase()
-  const total = order.lines.reduce((sum, line) => sum + lineTotal(line), 0)
+  const { subtotal, discount, total } = settleOrderAmounts(order)
   const orderNumber = order.id || `#${Date.now().toString().slice(-4)}`
   const time = order.time.includes(':') ? (order.time.length === 5 ? `${order.time}:00` : order.time) : '12:00:00'
 
@@ -342,21 +374,27 @@ export async function saveOrder(tenantId: string, order: Order, dbId?: string | 
     order_date: order.date,
     order_time: time,
     total_amount: total,
+    subtotal_amount: subtotal,
+    discount_amount: discount,
     payment_method: order.paymentMethod === 'bank' || order.paymentMethod === 'credit' ? order.paymentMethod : 'cash',
   }
 
+  const missingDiscountColumn = (message: string) =>
+    message.includes('discount_amount') || message.includes('subtotal_amount')
+      ? new Error('Run supabase/09-order-discount.sql to add order subtotal and discount columns, then try again.')
+      : null
+
   if (orderDbId) {
     const { error } = await supabase.from('orders').update(orderPayload).eq('id', orderDbId).eq('tenant_id', tenantId)
-    if (error) throw error
+    if (error) throw missingDiscountColumn(error.message) ?? error
     await supabase.from('order_lines').delete().eq('order_id', orderDbId)
   } else {
     const { data, error } = await supabase.from('orders').insert(orderPayload).select('id').single()
-    if (error) throw error
+    if (error) throw missingDiscountColumn(error.message) ?? error
     orderDbId = data.id
   }
 
   for (const [index, line] of order.lines.entries()) {
-    const addOnSum = line.addOns.reduce((s, a) => s + (Number(a.price) || 0), 0)
     const { data: lineRow, error: lineError } = await supabase
       .from('order_lines')
       .insert({
@@ -366,7 +404,7 @@ export async function saveOrder(tenantId: string, order: Order, dbId?: string | 
         name: line.name,
         qty: line.qty,
         unit_price: line.unitPrice,
-        line_total: Number(line.qty) * (Number(line.unitPrice) + addOnSum),
+        line_total: orderLineAmount(line),
         sort_order: index,
       })
       .select('id')
@@ -387,7 +425,7 @@ export async function saveOrder(tenantId: string, order: Order, dbId?: string | 
     }
   }
 
-  return { ...order, id: orderNumber, total }
+  return { ...order, id: orderNumber, subtotal, discount, total }
 }
 
 export async function updateOrderStatus(tenantId: string, orderNumber: string, status: Order['status']) {

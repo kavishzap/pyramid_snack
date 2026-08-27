@@ -1,10 +1,12 @@
 'use client'
 
 import { Fragment, useEffect, useState } from 'react'
-import { Check, ChevronLeft, ChevronRight, MoreHorizontal, Plus, Trash2, X } from 'lucide-react'
+import { Check, ChevronLeft, ChevronRight, Download, MoreHorizontal, Plus, Trash2, X } from 'lucide-react'
 
 import {
+  type AccountType,
   type AccountingBooks,
+  type GlAccount,
   type JournalEntry,
   type JournalLine,
   type Purchase,
@@ -23,7 +25,8 @@ import {
   upsertJournal,
 } from '@/lib/accounting'
 import * as booksApi from '@/lib/api/accounting'
-import { newId, type PayMethod } from '@/lib/domain'
+import { newId, type CompanySettings, type PayMethod } from '@/lib/domain'
+import { downloadReportPdf, reportFileName } from '@/lib/reportPdf'
 
 function Button({ children, onClick, variant = 'primary', type = 'button', className = '' }: { children: React.ReactNode; onClick?: () => void; variant?: string; type?: 'button' | 'submit'; className?: string }) {
   return <button type={type} onClick={onClick} className={`button button-${variant}${className ? ` ${className}` : ''}`}>{children}</button>
@@ -101,6 +104,28 @@ type BooksProps = {
 
 const today = () => new Date().toISOString().slice(0, 10)
 const PAGE_SIZE = 10
+
+const formatBookDate = (iso: string) => {
+  const d = new Date(`${String(iso).slice(0, 10)}T00:00:00`)
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+}
+
+const booksPeriod = (dates: string[]) => {
+  const sorted = dates.map(value => String(value || '').slice(0, 10)).filter(Boolean).sort()
+  if (!sorted.length) return 'All time'
+  const first = formatBookDate(sorted[0])
+  const last = formatBookDate(sorted[sorted.length - 1])
+  return first === last ? first : `${first} – ${last}`
+}
+
+function PdfDownloadButton({ downloading, onClick }: { downloading: boolean; onClick: () => void }) {
+  return (
+    <Button variant="secondary" onClick={onClick}>
+      <Download size={16} /> {downloading ? 'Preparing…' : 'Download PDF'}
+    </Button>
+  )
+}
 
 function usePagedRows<T>(rows: T[], pageSize = PAGE_SIZE) {
   const [page, setPage] = useState(1)
@@ -187,9 +212,10 @@ function TablePagination({
   )
 }
 
-export function PurchasesPage({ books, setBooks, tenantId, vatOn, toast, reload }: BooksProps) {
+export function PurchasesPage({ books, setBooks, tenantId, vatOn, toast, reload, company }: BooksProps & { company: CompanySettings }) {
   const [editing, setEditing] = useState<Purchase | null>(null)
   const [supplierName, setSupplierName] = useState('')
+  const [downloading, setDownloading] = useState(false)
 
   const blank = (): Purchase => ({
     id: '',
@@ -263,8 +289,70 @@ export function PurchasesPage({ books, setBooks, tenantId, vatOn, toast, reload 
         purchases: prev.purchases.filter(item => item.id !== purchase.id),
       }))
       toast('Purchase deleted')
+      if (tenantId) await reload?.()
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not delete purchase')
+    }
+  }
+
+  const downloadPdf = async () => {
+    setDownloading(true)
+    try {
+      const rows = [...books.purchases].sort((a, b) => b.date.localeCompare(a.date) || b.number.localeCompare(a.number))
+      const totals = rows.reduce((sum, purchase) => {
+        const parts = documentVat(purchaseTotal(purchase), purchase, vatOn)
+        return {
+          payable: sum.payable + parts.payable,
+          vat: sum.vat + parts.inputVat,
+          net: sum.net + parts.expense,
+        }
+      }, { payable: 0, vat: 0, net: 0 })
+      await downloadReportPdf({
+        company,
+        title: 'Purchases of goods',
+        period: booksPeriod(rows.map(purchase => purchase.date)),
+        filename: reportFileName('purchases'),
+        orientation: 'landscape',
+        kpis: [
+          { label: 'Bills', value: String(rows.length) },
+          { label: 'To pay', value: money(totals.payable) },
+          ...(vatOn ? [
+            { label: 'Net in P&L', value: money(totals.net) },
+            { label: 'VAT claimable', value: money(totals.vat) },
+          ] : []),
+          { label: 'Paid', value: String(rows.filter(purchase => purchase.status === 'paid').length) },
+        ],
+        tables: [
+          {
+            title: 'Supplier invoices',
+            head: vatOn
+              ? ['No.', 'Date', 'Supplier', 'Paid by', 'Status', 'VAT', 'Net', 'To pay']
+              : ['No.', 'Date', 'Supplier', 'Paid by', 'Status', 'Amount'],
+            rightAlign: vatOn ? [6, 7] : [5],
+            body: rows.map(purchase => {
+              const parts = documentVat(purchaseTotal(purchase), purchase, vatOn)
+              const vatLabel = `${purchase.vatInclusive !== false ? 'Incl.' : 'Excl.'} / ${purchase.vatClaimable !== false ? 'claimable' : 'not claimable'}`
+              return vatOn
+                ? [purchase.number, formatBookDate(purchase.date), purchase.supplierName, purchase.paymentMethod, purchase.status, vatLabel, money(parts.expense), money(parts.payable)]
+                : [purchase.number, formatBookDate(purchase.date), purchase.supplierName, purchase.paymentMethod, purchase.status, money(parts.payable)]
+            }),
+            foot: rows.length
+              ? vatOn
+                ? ['Total', '', '', '', '', '', money(totals.net), money(totals.payable)]
+                : ['Total', '', '', '', '', money(totals.payable)]
+              : undefined,
+          },
+        ],
+        notes: [
+          'Purchases are supplier invoices for goods. Cash and bank bills post to the cash book.',
+          ...(vatOn ? ['Net in P&L follows each bill’s VAT inclusive/exclusive and claimable flags. VAT is calculated at 15%.'] : ['The company is not VAT registered.']),
+        ],
+      })
+      toast('Purchases PDF downloaded')
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Could not generate PDF')
+    } finally {
+      setDownloading(false)
     }
   }
 
@@ -272,7 +360,10 @@ export function PurchasesPage({ books, setBooks, tenantId, vatOn, toast, reload 
     <div className="page-content">
       <div className="page-toolbar">
         <p className="muted">Supplier invoices for goods. Credit bills hit the purchase control (payables); cash/bank bills hit the cash book.</p>
-        <Button onClick={() => { setEditing(blank()); setSupplierName(books.suppliers[0]?.name ?? '') }}><Plus size={17} /> New purchase</Button>
+        <div className="toolbar-actions">
+          <PdfDownloadButton downloading={downloading} onClick={() => void downloadPdf()} />
+          <Button onClick={() => { setEditing(blank()); setSupplierName(books.suppliers[0]?.name ?? '') }}><Plus size={17} /> New purchase</Button>
+        </div>
       </div>
       <Card className="table-card">
         <div className="table-summary"><strong>Purchases of goods</strong></div>
@@ -374,6 +465,181 @@ export function PurchasesPage({ books, setBooks, tenantId, vatOn, toast, reload 
   )
 }
 
+const ACCOUNT_TYPES: { value: AccountType; label: string }[] = [
+  { value: 'asset', label: 'Asset' },
+  { value: 'liability', label: 'Liability' },
+  { value: 'equity', label: 'Equity' },
+  { value: 'income', label: 'Income' },
+  { value: 'expense', label: 'Expense' },
+]
+
+function ChartOfAccountsSection({ books, setBooks, tenantId, toast, reload }: BooksProps) {
+  const [editing, setEditing] = useState<GlAccount | null>(null)
+  const [pendingDelete, setPendingDelete] = useState<GlAccount | null>(null)
+  const paged = usePagedRows(books.accounts)
+  const blank = (): GlAccount => ({
+    id: '',
+    code: '',
+    name: '',
+    type: 'expense',
+    isControl: false,
+    isSystem: false,
+    description: '',
+  })
+
+  const save = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!editing) return
+    const draft: GlAccount = {
+      ...editing,
+      code: editing.code.trim(),
+      name: editing.name.trim(),
+      description: editing.description?.trim() || '',
+    }
+    if (!draft.code || !draft.name) return toast('Code and account name are required')
+    const clash = books.accounts.find(item => item.id !== draft.id && item.code.toLowerCase() === draft.code.toLowerCase())
+    if (clash) return toast('That account code is already in use')
+    try {
+      const saved = tenantId
+        ? await booksApi.saveAccount(tenantId, draft)
+        : { ...draft, id: draft.id || newId() }
+      setBooks(prev => ({
+        ...prev,
+        accounts: draft.id
+          ? prev.accounts.map(item => item.id === draft.id ? saved : item)
+          : [...prev.accounts, saved].sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true })),
+      }))
+      if (tenantId) await reload?.()
+      setEditing(null)
+      toast(draft.id ? 'Account updated' : 'Account added')
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Could not save the account')
+    }
+  }
+
+  const confirmDelete = async () => {
+    if (!pendingDelete) return
+    try {
+      if (pendingDelete.isSystem) throw new Error('System accounts cannot be deleted')
+      if (tenantId) await booksApi.deleteAccount(tenantId, pendingDelete)
+      setBooks(prev => ({ ...prev, accounts: prev.accounts.filter(item => item.id !== pendingDelete.id) }))
+      if (tenantId) await reload?.()
+      setPendingDelete(null)
+      setEditing(null)
+      toast('Account removed')
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Could not delete the account')
+    }
+  }
+
+  return (
+    <>
+      <Card className="table-card">
+        <div className="table-summary">
+          <div>
+            <strong>Chart of accounts</strong>
+            <div className="muted">{paged.total} {paged.total === 1 ? 'account' : 'accounts'}</div>
+          </div>
+          <Button onClick={() => setEditing(blank())}><Plus size={17} /> Add account</Button>
+        </div>
+        <div className="data-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Code</th>
+                <th>Account</th>
+                <th>Type</th>
+                <th>Control</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {paged.slice.map(account => (
+                <tr key={account.id}>
+                  <td className="muted">{account.code}</td>
+                  <td>
+                    <strong>{account.name}</strong>
+                    {account.description ? <div className="muted">{account.description}</div> : null}
+                    {account.isSystem ? <div className="muted">System</div> : null}
+                  </td>
+                  <td className="muted">{ACCOUNT_TYPES.find(item => item.value === account.type)?.label || account.type}</td>
+                  <td className="muted">{account.isControl ? 'Yes' : '—'}</td>
+                  <td>
+                    <div className="row-actions">
+                      <button className="more-button" onClick={() => setEditing(account)} aria-label={`Edit ${account.name}`}><MoreHorizontal size={18} /></button>
+                      {!account.isSystem && (
+                        <button className="more-button" onClick={() => setPendingDelete(account)} aria-label={`Delete ${account.name}`}><Trash2 size={16} /></button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+              {!books.accounts.length && <tr><td colSpan={5} className="muted">No accounts yet.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        <TablePagination {...paged} noun={paged.total === 1 ? 'account' : 'accounts'} />
+      </Card>
+      {editing && !pendingDelete && (
+        <Dialog title={editing.id ? 'Edit account' : 'Add account'} close={() => setEditing(null)}>
+          <form onSubmit={save}>
+            <div className="form-grid">
+              <label>Code
+                <input
+                  value={editing.code}
+                  onChange={e => setEditing({ ...editing, code: e.target.value })}
+                  placeholder="5400"
+                  required
+                  disabled={Boolean(editing.isSystem)}
+                />
+              </label>
+              <label>Type
+                <select
+                  value={editing.type}
+                  onChange={e => setEditing({ ...editing, type: e.target.value as AccountType })}
+                  disabled={Boolean(editing.isSystem)}
+                >
+                  {ACCOUNT_TYPES.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}
+                </select>
+              </label>
+              <label className="full-span">Account
+                <input value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })} placeholder="Rent, electricity, staff meals…" required />
+              </label>
+              <label className="full-span">Description
+                <input value={editing.description ?? ''} onChange={e => setEditing({ ...editing, description: e.target.value })} placeholder="Optional note" />
+              </label>
+              {!editing.isSystem && (
+                <label className="check">
+                  <input type="checkbox" checked={Boolean(editing.isControl)} onChange={e => setEditing({ ...editing, isControl: e.target.checked })} />
+                  Control account
+                </label>
+              )}
+            </div>
+            <div className="dialog-actions">
+              {editing.id && !editing.isSystem && (
+                <Button variant="danger" type="button" onClick={() => setPendingDelete(editing)}><Trash2 size={16} /> Delete</Button>
+              )}
+              <span className="dialog-actions-spacer" />
+              <Button variant="secondary" type="button" onClick={() => setEditing(null)}>Cancel</Button>
+              <Button type="submit"><Check size={16} /> Save</Button>
+            </div>
+          </form>
+        </Dialog>
+      )}
+      {pendingDelete && (
+        <Dialog title="Delete account?" close={() => setPendingDelete(null)}>
+          <p className="confirm-copy">Remove “{pendingDelete.name}” ({pendingDelete.code}) from the chart of accounts? Past journals keep their posted lines.</p>
+          <div className="dialog-actions">
+            <span className="dialog-actions-spacer" />
+            <Button variant="secondary" type="button" onClick={() => setPendingDelete(null)}>Cancel</Button>
+            <Button variant="danger" type="button" onClick={() => void confirmDelete()}>Delete</Button>
+          </div>
+        </Dialog>
+      )}
+    </>
+  )
+}
+
 export function JournalsPage({ books, setBooks, tenantId, toast, reload }: BooksProps) {
   const [editing, setEditing] = useState<JournalEntry | null>(null)
   const paged = usePagedRows(books.journals)
@@ -424,6 +690,7 @@ export function JournalsPage({ books, setBooks, tenantId, toast, reload }: Books
     try {
       if (tenantId) await booksApi.deleteManualJournal(tenantId, entry.id)
       setBooks(prev => ({ ...prev, journals: prev.journals.filter(item => item.id !== entry.id) }))
+      if (tenantId) await reload?.()
       toast('Journal deleted')
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not delete journal')
@@ -432,6 +699,7 @@ export function JournalsPage({ books, setBooks, tenantId, toast, reload }: Books
 
   return (
     <div className="page-content">
+      <ChartOfAccountsSection books={books} setBooks={setBooks} tenantId={tenantId} vatOn={false} toast={toast} reload={reload} />
       <div className="page-toolbar">
         <p className="muted">Every sale, purchase, receipt, payment, and expense posts here. Use a manual entry for adjustments, opening balances, or year-end journals.</p>
         <Button onClick={() => setEditing(blank())}><Plus size={17} /> Manual entry</Button>
@@ -546,16 +814,81 @@ export function JournalsPage({ books, setBooks, tenantId, toast, reload }: Books
   )
 }
 
-export function LedgerPage({ books }: { books: AccountingBooks }) {
+export function LedgerPage({ books, company, toast }: { books: AccountingBooks; company: CompanySettings; toast: (message: string) => void }) {
   const rows = trialBalance(books)
   const [accountId, setAccountId] = useState(books.accounts.find(item => item.code === '1000')?.id || books.accounts[0]?.id || '')
+  const [downloading, setDownloading] = useState(false)
+  useEffect(() => {
+    if (accountId && books.accounts.some(item => item.id === accountId)) return
+    setAccountId(books.accounts.find(item => item.code === '1000')?.id || books.accounts[0]?.id || '')
+  }, [books.accounts, accountId])
   const moves = accountId ? accountLedger(books, accountId) : []
   const account = books.accounts.find(item => item.id === accountId)
   const debitTotal = rows.reduce((sum, row) => sum + row.displayDebit, 0)
   const creditTotal = rows.reduce((sum, row) => sum + row.displayCredit, 0)
 
+  const downloadPdf = async () => {
+    setDownloading(true)
+    try {
+      await downloadReportPdf({
+        company,
+        title: 'General ledger',
+        period: booksPeriod(books.journals.map(entry => entry.date)),
+        filename: reportFileName('ledger'),
+        orientation: 'landscape',
+        kpis: [
+          { label: 'Accounts with movement', value: String(rows.length) },
+          { label: 'Debit total', value: money(debitTotal) },
+          { label: 'Credit total', value: money(creditTotal) },
+          { label: 'Account ledger', value: account ? `${account.code} ${account.name}` : '-' },
+        ],
+        tables: [
+          {
+            title: 'Trial balance',
+            head: ['Code', 'Account', 'Type', 'Debit', 'Credit'],
+            rightAlign: [3, 4],
+            body: rows.map(row => [
+              row.account.code,
+              `${row.account.name}${row.account.isControl ? ' (control)' : ''}`,
+              row.account.type,
+              row.displayDebit ? money(row.displayDebit) : '',
+              row.displayCredit ? money(row.displayCredit) : '',
+            ]),
+            foot: rows.length ? ['Totals', '', '', money(debitTotal), money(creditTotal)] : undefined,
+          },
+          {
+            title: `Account ledger | ${account ? `${account.code} ${account.name}` : 'Account'}`,
+            head: ['Date', 'Journal', 'Particulars', 'Debit', 'Credit', 'Balance'],
+            rightAlign: [3, 4, 5],
+            body: moves.map(move => [
+              formatBookDate(move.date),
+              move.number,
+              move.memo,
+              move.debit ? money(move.debit) : '',
+              move.credit ? money(move.credit) : '',
+              money(move.balance),
+            ]),
+          },
+        ],
+        notes: [
+          'Trial balance includes posted journals only. Debit and credit columns are the closing position of each account.',
+          'The account ledger matches the account selected on screen.',
+        ],
+      })
+      toast('Ledger PDF downloaded')
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Could not generate PDF')
+    } finally {
+      setDownloading(false)
+    }
+  }
+
   return (
     <div className="page-content">
+      <div className="page-toolbar">
+        <p className="muted">Trial balance from posted journals, plus movements on the selected account.</p>
+        <PdfDownloadButton downloading={downloading} onClick={() => void downloadPdf()} />
+      </div>
       <Card className="table-card">
         <div className="table-summary"><strong>Trial balance</strong><span className="muted">General ledger in MUR</span></div>
         <div className="data-table-wrap">
@@ -636,10 +969,59 @@ export function LedgerPage({ books }: { books: AccountingBooks }) {
   )
 }
 
-export function CashBookPage({ books }: { books: AccountingBooks }) {
+export function CashBookPage({ books, company, toast }: { books: AccountingBooks; company: CompanySettings; toast: (message: string) => void }) {
   const [tab, setTab] = useState<'1000' | '1010'>('1000')
+  const [downloading, setDownloading] = useState(false)
   const moves = cashBook(books, tab)
   const balance = moves.length ? moves[moves.length - 1].balance : 0
+  const inTotal = moves.reduce((sum, move) => sum + (Number(move.debit) || 0), 0)
+  const outTotal = moves.reduce((sum, move) => sum + (Number(move.credit) || 0), 0)
+  const bookLabel = tab === '1000' ? 'Cash on hand' : 'Bank'
+
+  const downloadPdf = async () => {
+    setDownloading(true)
+    try {
+      await downloadReportPdf({
+        company,
+        title: tab === '1000' ? 'Cash book' : 'Bank book',
+        period: booksPeriod(moves.map(move => move.date)),
+        filename: reportFileName(tab === '1000' ? 'cash-book' : 'bank-book'),
+        orientation: 'landscape',
+        kpis: [
+          { label: 'Closing balance', value: money(balance) },
+          { label: 'In', value: money(inTotal) },
+          { label: 'Out', value: money(outTotal) },
+          { label: 'Movements', value: String(moves.length) },
+        ],
+        tables: [
+          {
+            title: bookLabel,
+            head: ['Date', 'Journal', 'Particulars', 'In', 'Out', 'Balance'],
+            rightAlign: [3, 4, 5],
+            body: moves.map(move => [
+              formatBookDate(move.date),
+              move.number,
+              move.memo,
+              move.debit ? money(move.debit) : '',
+              move.credit ? money(move.credit) : '',
+              money(move.balance),
+            ]),
+            foot: moves.length ? ['Total', '', '', money(inTotal), money(outTotal), money(balance)] : undefined,
+          },
+        ],
+        notes: [
+          tab === '1000'
+            ? 'Cash on hand (account 1000) from posted journals. Switch to Bank on screen to export that book.'
+            : 'Bank (account 1010) from posted journals. Switch to Cash on hand on screen to export that book.',
+        ],
+      })
+      toast(`${bookLabel} PDF downloaded`)
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Could not generate PDF')
+    } finally {
+      setDownloading(false)
+    }
+  }
 
   return (
     <div className="page-content">
@@ -648,7 +1030,10 @@ export function CashBookPage({ books }: { books: AccountingBooks }) {
           <button type="button" className={tab === '1000' ? 'active' : ''} onClick={() => setTab('1000')}>Cash on hand</button>
           <button type="button" className={tab === '1010' ? 'active' : ''} onClick={() => setTab('1010')}>Bank</button>
         </div>
-        <strong>{money(balance)}</strong>
+        <div className="toolbar-actions">
+          <strong>{money(balance)}</strong>
+          <PdfDownloadButton downloading={downloading} onClick={() => void downloadPdf()} />
+        </div>
       </div>
       <Card className="table-card">
         <div className="table-summary"><strong>{tab === '1000' ? 'Cash book' : 'Bank book'}</strong></div>

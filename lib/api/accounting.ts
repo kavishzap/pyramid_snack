@@ -24,6 +24,8 @@ type AccountRow = {
   name: string
   account_type: GlAccount['type']
   is_control: boolean
+  is_system?: boolean
+  description?: string
 }
 
 const mapAccount = (row: AccountRow): GlAccount => ({
@@ -32,7 +34,17 @@ const mapAccount = (row: AccountRow): GlAccount => ({
   name: row.name,
   type: row.account_type,
   isControl: Boolean(row.is_control),
+  isSystem: Boolean(row.is_system),
+  description: String(row.description ?? ''),
 })
+
+function accountWriteError(error: { code?: string; message?: string } | null) {
+  if (!error) return
+  if (error.code === '23505' || /duplicate|unique/i.test(error.message || '')) {
+    throw new Error('That account code is already in use')
+  }
+  throw new Error(error.message || 'Could not save the account')
+}
 
 function numbered(prefix: string, values: string[]) {
   const max = values.reduce((highest, value) => {
@@ -46,14 +58,77 @@ function numbered(prefix: string, values: string[]) {
 export async function fetchAccounts(tenantId: string): Promise<GlAccount[]> {
   const supabase = getSupabase()
   await supabase.rpc('seed_chart_of_accounts', { p_tenant_id: tenantId })
-  const { data, error } = await supabase
+  const withDescription = await supabase
     .from('gl_accounts')
-    .select('id, code, name, account_type, is_control')
+    .select('id, code, name, account_type, is_control, is_system, description')
     .eq('tenant_id', tenantId)
     .eq('is_active', true)
     .order('code')
-  if (error) throw error
+  if (!withDescription.error) return (withDescription.data || []).map(mapAccount)
+  if (!/description/i.test(withDescription.error.message || '')) throw withDescription.error
+  const { data, error } = await supabase
+    .from('gl_accounts')
+    .select('id, code, name, account_type, is_control, is_system')
+    .eq('tenant_id', tenantId)
+    .eq('is_active', true)
+    .order('code')
+  if (error) throw withDescription.error
   return (data || []).map(mapAccount)
+}
+
+export async function saveAccount(tenantId: string, account: GlAccount): Promise<GlAccount> {
+  const supabase = getSupabase()
+  const code = account.code.trim()
+  const name = account.name.trim()
+  if (!code || !name) throw new Error('Code and account name are required')
+  if (account.id) {
+    const payload = account.isSystem
+      ? { name, description: account.description?.trim() || '' }
+      : {
+          code,
+          name,
+          account_type: account.type,
+          is_control: Boolean(account.isControl),
+          description: account.description?.trim() || '',
+        }
+    const { data, error } = await supabase
+      .from('gl_accounts')
+      .update(payload)
+      .eq('id', account.id)
+      .eq('tenant_id', tenantId)
+      .select('id, code, name, account_type, is_control, is_system, description')
+      .single()
+    accountWriteError(error)
+    return mapAccount(data as AccountRow)
+  }
+  const { data, error } = await supabase
+    .from('gl_accounts')
+    .insert({
+      tenant_id: tenantId,
+      code,
+      name,
+      account_type: account.type,
+      is_control: Boolean(account.isControl),
+      is_system: false,
+      is_active: true,
+      description: account.description?.trim() || '',
+    })
+    .select('id, code, name, account_type, is_control, is_system, description')
+    .single()
+  accountWriteError(error)
+  return mapAccount(data as AccountRow)
+}
+
+export async function deleteAccount(tenantId: string, account: GlAccount) {
+  if (account.isSystem) throw new Error('System accounts cannot be deleted')
+  const supabase = getSupabase()
+  const { error } = await supabase
+    .from('gl_accounts')
+    .update({ is_active: false })
+    .eq('id', account.id)
+    .eq('tenant_id', tenantId)
+    .eq('is_system', false)
+  if (error) throw new Error(error.message)
 }
 
 export async function fetchJournals(tenantId: string, accounts: GlAccount[]): Promise<JournalEntry[]> {

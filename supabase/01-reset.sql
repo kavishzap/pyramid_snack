@@ -24,6 +24,7 @@ DROP TABLE IF EXISTS public.order_line_addons CASCADE;
 DROP TABLE IF EXISTS public.order_lines CASCADE;
 DROP TABLE IF EXISTS public.orders CASCADE;
 DROP TABLE IF EXISTS public.dining_tables CASCADE;
+DROP TABLE IF EXISTS public.menu_item_target_categories CASCADE;
 DROP TABLE IF EXISTS public.menu_items CASCADE;
 DROP TABLE IF EXISTS public.categories CASCADE;
 DROP TABLE IF EXISTS public.tenant_memberships CASCADE;

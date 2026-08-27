@@ -20,6 +20,10 @@ export function createBrowserClient(): SupabaseClient {
       autoRefreshToken: true,
       detectSessionInUrl: true,
     },
+    global: {
+      fetch: (input: RequestInfo | URL, init?: RequestInit) =>
+        fetch(input, { ...init, cache: 'no-store' }),
+    },
   })
 }
 

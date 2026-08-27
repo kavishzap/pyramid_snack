@@ -1,4 +1,4 @@
-import { newId, type Expense, type Order, type PayMethod } from '@/lib/domain'
+import { newId, settleOrderAmounts, type Expense, type Order, type PayMethod } from '@/lib/domain'
 
 export type AccountType = 'asset' | 'liability' | 'equity' | 'income' | 'expense'
 export type JournalSource = 'manual' | 'sale' | 'purchase' | 'receipt' | 'payment' | 'expense'
@@ -11,6 +11,8 @@ export type GlAccount = {
   name: string
   type: AccountType
   isControl: boolean
+  isSystem?: boolean
+  description?: string
 }
 
 export type JournalLine = {
@@ -101,6 +103,7 @@ export const ACCOUNT_CODES = {
   outputVat: '2100',
   capital: '3000',
   sales: '4000',
+  salesDiscounts: '4090',
   purchases: '5000',
   distribution: '5100',
   admin: '5200',
@@ -108,19 +111,20 @@ export const ACCOUNT_CODES = {
 } as const
 
 export const SYSTEM_ACCOUNTS: Omit<GlAccount, 'id'>[] = [
-  { code: '1000', name: 'Cash on hand', type: 'asset', isControl: false },
-  { code: '1010', name: 'Bank', type: 'asset', isControl: false },
-  { code: '1100', name: 'Trade receivables (sales control)', type: 'asset', isControl: true },
-  { code: '1200', name: 'Inventory of goods', type: 'asset', isControl: false },
-  { code: '1300', name: 'Input VAT receivable', type: 'asset', isControl: false },
-  { code: '2000', name: 'Trade payables (purchase control)', type: 'liability', isControl: true },
-  { code: '2100', name: 'Output VAT payable', type: 'liability', isControl: false },
-  { code: '3000', name: 'Capital', type: 'equity', isControl: false },
-  { code: '4000', name: 'Restaurant sales', type: 'income', isControl: false },
-  { code: '5000', name: 'Purchases of goods / cost of sales', type: 'expense', isControl: false },
-  { code: '5100', name: 'Distribution costs', type: 'expense', isControl: false },
-  { code: '5200', name: 'Administrative expenses', type: 'expense', isControl: false },
-  { code: '5300', name: 'Other expenses', type: 'expense', isControl: false },
+  { code: '1000', name: 'Cash on hand', type: 'asset', isControl: false, isSystem: true },
+  { code: '1010', name: 'Bank', type: 'asset', isControl: false, isSystem: true },
+  { code: '1100', name: 'Trade receivables (sales control)', type: 'asset', isControl: true, isSystem: true },
+  { code: '1200', name: 'Inventory of goods', type: 'asset', isControl: false, isSystem: true },
+  { code: '1300', name: 'Input VAT receivable', type: 'asset', isControl: false, isSystem: true },
+  { code: '2000', name: 'Trade payables (purchase control)', type: 'liability', isControl: true, isSystem: true },
+  { code: '2100', name: 'Output VAT payable', type: 'liability', isControl: false, isSystem: true },
+  { code: '3000', name: 'Capital', type: 'equity', isControl: false, isSystem: true },
+  { code: '4000', name: 'Restaurant sales', type: 'income', isControl: false, isSystem: true },
+  { code: '4090', name: 'Sales discounts', type: 'income', isControl: false, isSystem: true },
+  { code: '5000', name: 'Purchases of goods / cost of sales', type: 'expense', isControl: false, isSystem: true },
+  { code: '5100', name: 'Distribution costs', type: 'expense', isControl: false, isSystem: true },
+  { code: '5200', name: 'Administrative expenses', type: 'expense', isControl: false, isSystem: true },
+  { code: '5300', name: 'Other expenses', type: 'expense', isControl: false, isSystem: true },
 ]
 
 export const VAT_RATE = 0.15
@@ -244,26 +248,54 @@ const cashOrBank = (accounts: GlAccount[], method: PayMethod | SettleMethod) =>
 
 export function buildSaleJournal(accounts: GlAccount[], order: Order, vatRegistered: boolean): Omit<JournalEntry, 'id' | 'number'> | null {
   if (order.status !== 'Completed') return null
-  const total = roundMoney(order.total)
-  if (total <= 0) return null
+  const { subtotal, discount, total: net } = settleOrderAmounts(order)
+  if (subtotal <= 0 && net <= 0) return null
   const method = order.paymentMethod || 'cash'
-  const parts = vatSplit(total, vatRegistered)
+  const gross = vatSplit(subtotal, vatRegistered)
+  const collected = vatSplit(net, vatRegistered)
+  const discountExcl = roundMoney(gross.exclusive - collected.exclusive)
+  const vatAdj = roundMoney(gross.vat - collected.vat)
+  const discountAccount = accounts.find(item => item.code === ACCOUNT_CODES.salesDiscounts)
+    || accounts.find(item => item.code === '4100')
+  const useDiscountAccount = Boolean(discountAccount) && discount > 0
   const debitAccount = method === 'credit'
     ? requireAccount(accounts, ACCOUNT_CODES.receivables)
     : cashOrBank(accounts, method)
   const sales = requireAccount(accounts, ACCOUNT_CODES.sales)
-  const lines = [
-    line(debitAccount, total, 0, `Sale ${order.id}`, order.clientName),
-    line(sales, 0, parts.exclusive, 'Restaurant sales', order.clientName),
-  ]
-  if (vatRegistered && parts.vat) {
-    lines.push(line(requireAccount(accounts, ACCOUNT_CODES.outputVat), 0, parts.vat, 'Output VAT on sales', order.clientName))
+  const lines: JournalLine[] = []
+
+  if (!useDiscountAccount || !discountAccount) {
+    if (net <= 0) return null
+    lines.push(line(debitAccount, net, 0, `Sale ${order.id}`, order.clientName))
+    lines.push(line(sales, 0, collected.exclusive, 'Restaurant sales', order.clientName))
+    if (vatRegistered && collected.vat) {
+      lines.push(line(requireAccount(accounts, ACCOUNT_CODES.outputVat), 0, collected.vat, 'Output VAT on sales', order.clientName))
+    }
+  } else {
+    if (net > 0) {
+      lines.push(line(debitAccount, net, 0, `Sale ${order.id}`, order.clientName))
+    }
+    if (discountExcl > 0) {
+      lines.push(line(discountAccount, discountExcl, 0, 'Sales discount', order.clientName))
+    }
+    lines.push(line(sales, 0, gross.exclusive, 'Restaurant sales', order.clientName))
+    if (vatRegistered && (vatAdj > 0 || gross.vat > 0)) {
+      const outputVat = requireAccount(accounts, ACCOUNT_CODES.outputVat)
+      if (vatAdj > 0) {
+        lines.push(line(outputVat, vatAdj, 0, 'Output VAT adjustment on discount', order.clientName))
+      }
+      if (gross.vat > 0) {
+        lines.push(line(outputVat, 0, gross.vat, 'Output VAT on sales', order.clientName))
+      }
+    }
   }
+
+  const memoDiscount = discount > 0 ? ` · discount ${discount.toFixed(2)}` : ''
   return {
     date: order.date,
     source: 'sale',
     sourceRef: order.id,
-    memo: `Sale ${order.id} · ${order.clientName} · ${method}`,
+    memo: `Sale ${order.id} · ${order.clientName} · ${method}${memoDiscount}`,
     lines,
   }
 }

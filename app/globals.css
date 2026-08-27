@@ -507,6 +507,8 @@ button { cursor: pointer; }
   .pagination-controls{justify-content:space-between}
 }
 .table-card + .table-card{margin-top:18px}
+.page-content > .table-card + .page-toolbar{margin-top:18px}
+.page-content > .table-card + .page-toolbar{margin-top:18px}
 .journal-entry-row td{border-bottom:0;background:#fffcf7;padding-bottom:6px}
 .journal-line-row td{border-bottom:0;padding-top:6px;padding-bottom:6px}
 .journal-account{padding-left:28px;font-weight:600}
@@ -544,3 +546,15 @@ button { cursor: pointer; }
   background:#d6d2c752;
 }
 .sidebar nav::-webkit-scrollbar-thumb:hover{background:#e6e2d4a6}
+.toast{z-index:80}
+.target-cats{display:flex;flex-direction:column;gap:8px}
+.target-cats > span:first-child{font-size:12px;font-weight:700}
+.target-cats .order-addon-list{padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--secondary)}
+.dialog .form-error{margin:12px 0 0;font-size:12px}
+.order-totals{display:flex;flex-direction:column;gap:10px;margin-top:8px;padding-top:12px;border-top:1px solid var(--border)}
+.order-totals .line-items-total{margin:0}
+.order-totals .muted-total strong{font-weight:600}
+.order-discount-row{display:flex;flex-direction:row;align-items:center;justify-content:space-between;gap:12px}
+.order-discount-row input{width:160px;max-width:40%}
+.order-money-stack{display:flex;flex-direction:column;gap:2px;align-items:flex-end;line-height:1.35;font-size:12px}
+.order-money-stack strong{font-size:13px}

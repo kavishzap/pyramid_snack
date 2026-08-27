@@ -65,6 +65,17 @@ CREATE TABLE menu_items (
 -- Same dish name allowed across categories / day-night-happy-hour price variants
 CREATE INDEX idx_menu_items_tenant_category ON menu_items(tenant_id, category_id);
 
+CREATE TABLE menu_item_target_categories (
+  menu_item_id  UUID NOT NULL REFERENCES menu_items(id) ON DELETE CASCADE,
+  category_id   UUID NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+  tenant_id     UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (menu_item_id, category_id)
+);
+
+CREATE INDEX idx_menu_item_target_categories_tenant
+  ON menu_item_target_categories(tenant_id, category_id);
+
 CREATE TABLE dining_tables (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id       UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -86,7 +97,11 @@ CREATE TABLE orders (
   status          order_status NOT NULL DEFAULT 'new',
   order_date      DATE NOT NULL DEFAULT CURRENT_DATE,
   order_time      TIME NOT NULL DEFAULT LOCALTIME,
+  subtotal_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (subtotal_amount >= 0),
+  discount_amount NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (discount_amount >= 0),
   total_amount    NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (total_amount >= 0),
+  CHECK (discount_amount <= subtotal_amount),
+  CHECK (total_amount = subtotal_amount - discount_amount),
   notes           TEXT NOT NULL DEFAULT '',
   created_by      UUID REFERENCES auth.users(id) ON DELETE SET NULL,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -259,6 +274,7 @@ GRANT EXECUTE ON FUNCTION public.ensure_my_restaurant() TO authenticated;
 ALTER TABLE tenants ENABLE ROW LEVEL SECURITY;
 ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE menu_items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE menu_item_target_categories ENABLE ROW LEVEL SECURITY;
 ALTER TABLE dining_tables ENABLE ROW LEVEL SECURITY;
 ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
 ALTER TABLE order_lines ENABLE ROW LEVEL SECURITY;
@@ -277,6 +293,10 @@ CREATE POLICY categories_all ON categories
   WITH CHECK (tenant_id IN (SELECT public.user_tenant_ids()));
 
 CREATE POLICY menu_items_all ON menu_items
+  FOR ALL USING (tenant_id IN (SELECT public.user_tenant_ids()))
+  WITH CHECK (tenant_id IN (SELECT public.user_tenant_ids()));
+
+CREATE POLICY menu_item_target_categories_all ON menu_item_target_categories
   FOR ALL USING (tenant_id IN (SELECT public.user_tenant_ids()))
   WITH CHECK (tenant_id IN (SELECT public.user_tenant_ids()));
 

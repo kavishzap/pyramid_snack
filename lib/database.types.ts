@@ -80,6 +80,20 @@ export type Database = {
         }
         Update: Partial<Database['public']['Tables']['menu_items']['Row']>
       }
+      menu_item_target_categories: {
+        Row: {
+          menu_item_id: string
+          category_id: string
+          tenant_id: string
+          created_at: string
+        }
+        Insert: {
+          menu_item_id: string
+          category_id: string
+          tenant_id: string
+        }
+        Update: Partial<Database['public']['Tables']['menu_item_target_categories']['Row']>
+      }
       dining_tables: {
         Row: {
           id: string
@@ -110,6 +124,8 @@ export type Database = {
           payment_method: 'cash' | 'bank' | 'credit'
           order_date: string
           order_time: string
+          subtotal_amount: number
+          discount_amount: number
           total_amount: number
           notes: string
           created_by: string | null
@@ -126,6 +142,8 @@ export type Database = {
           payment_method?: 'cash' | 'bank' | 'credit'
           order_date?: string
           order_time?: string
+          subtotal_amount?: number
+          discount_amount?: number
           total_amount?: number
           notes?: string
           created_by?: string | null
@@ -242,6 +260,31 @@ export type Database = {
           sort_order?: number
         }
         Update: Partial<Database['public']['Tables']['expense_lines']['Row']>
+      }
+      gl_accounts: {
+        Row: {
+          id: string
+          tenant_id: string
+          code: string
+          name: string
+          account_type: 'asset' | 'liability' | 'equity' | 'income' | 'expense'
+          description: string
+          is_control: boolean
+          is_system: boolean
+          is_active: boolean
+          created_at: string
+        }
+        Insert: {
+          tenant_id: string
+          code: string
+          name: string
+          account_type: 'asset' | 'liability' | 'equity' | 'income' | 'expense'
+          description?: string
+          is_control?: boolean
+          is_system?: boolean
+          is_active?: boolean
+        }
+        Update: Partial<Database['public']['Tables']['gl_accounts']['Row']>
       }
     }
     Views: Record<string, never>
