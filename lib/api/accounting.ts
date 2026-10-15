@@ -15,6 +15,7 @@ import {
   buildReceiptJournal,
   buildSaleJournal,
   journalTotals,
+  nextJournalNumber,
 } from '@/lib/accounting'
 import type { Expense, Order } from '@/lib/domain'
 
@@ -131,33 +132,55 @@ export async function deleteAccount(tenantId: string, account: GlAccount) {
   if (error) throw new Error(error.message)
 }
 
+async function fetchEveryRow<T>(
+  load: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
+): Promise<T[]> {
+  const size = 1000
+  const rows: T[] = []
+  for (let from = 0; ; from += size) {
+    const { data, error } = await load(from, from + size - 1)
+    if (error) throw new Error(error.message)
+    const page = data ?? []
+    rows.push(...page)
+    if (page.length < size) return rows
+  }
+}
+
 export async function fetchJournals(tenantId: string, accounts: GlAccount[]): Promise<JournalEntry[]> {
   const supabase = getSupabase()
-  const [{ data: entries, error: entryError }, { data: lines, error: lineError }] = await Promise.all([
-    supabase
-      .from('journal_entries')
-      .select('*')
-      .eq('tenant_id', tenantId)
-      .order('entry_date', { ascending: false })
-      .order('entry_no', { ascending: false }),
-    supabase
-      .from('journal_lines')
-      .select('*')
-      .eq('tenant_id', tenantId)
-      .order('sort_order', { ascending: true }),
+  const [entries, lines] = await Promise.all([
+    fetchEveryRow<Record<string, unknown>>(async (from, to) => {
+      const { data, error } = await supabase
+        .from('journal_entries')
+        .select('*')
+        .eq('tenant_id', tenantId)
+        .order('entry_date', { ascending: false })
+        .order('entry_no', { ascending: false })
+        .range(from, to)
+      return { data: (data || []) as Record<string, unknown>[], error }
+    }),
+    fetchEveryRow<Record<string, unknown>>(async (from, to) => {
+      const { data, error } = await supabase
+        .from('journal_lines')
+        .select('*')
+        .eq('tenant_id', tenantId)
+        .order('journal_id', { ascending: true })
+        .order('sort_order', { ascending: true })
+        .range(from, to)
+      return { data: (data || []) as Record<string, unknown>[], error }
+    }),
   ])
-  if (entryError) throw entryError
-  if (lineError) throw lineError
   const byId = new Map(accounts.map(account => [account.id, account]))
   const linesByJournal = new Map<string, Array<Record<string, unknown>>>()
-  for (const line of lines || []) {
+  for (const line of lines) {
     const journalId = String(line.journal_id)
     const list = linesByJournal.get(journalId) || []
-    list.push(line as Record<string, unknown>)
+    list.push(line)
     linesByJournal.set(journalId, list)
   }
-  return (entries || []).map((row: Record<string, unknown>) => {
-    const linesRaw = linesByJournal.get(String(row.id)) || []
+  return entries.map(row => {
+    const linesRaw = (linesByJournal.get(String(row.id)) || [])
+      .sort((a, b) => Number(a.sort_order ?? 0) - Number(b.sort_order ?? 0))
     return {
       id: String(row.id),
       number: String(row.entry_no),
@@ -372,6 +395,79 @@ export async function deleteManualJournal(tenantId: string, id: string) {
   const supabase = getSupabase()
   const { error } = await supabase.from('journal_entries').delete().eq('id', id).eq('tenant_id', tenantId).eq('source', 'manual')
   if (error) throw error
+}
+
+const moneyKey = (amount: number) => (Math.round((Number(amount) || 0) * 100) / 100).toFixed(2)
+
+const saleSignature = (entry: { date: string; lines: Array<{ accountCode: string; debit: number; credit: number }> }) => {
+  const lines = entry.lines
+    .map(line => `${line.accountCode}:${moneyKey(line.debit)}:${moneyKey(line.credit)}`)
+    .sort()
+    .join('|')
+  return `${entry.date.slice(0, 10)}|${lines}`
+}
+
+export async function syncSaleJournals(tenantId: string, books: AccountingBooks, orders: Order[], vatRegistered: boolean): Promise<AccountingBooks> {
+  const expected = orders.flatMap(order => {
+    const draft = buildSaleJournal(books.accounts, order, vatRegistered)
+    return draft ? [draft] : []
+  })
+  const existing = books.journals.filter(journal => journal.source === 'sale')
+  const byRef = new Map(existing.map(journal => [journal.sourceRef, journal]))
+  const unchanged = existing.length === expected.length && expected.every(draft => {
+    const current = byRef.get(draft.sourceRef)
+    return Boolean(current && saleSignature(current) === saleSignature(draft))
+  })
+  if (unchanged) return books
+
+  const supabase = getSupabase()
+  const { error: deleteError } = await supabase.from('journal_entries').delete().eq('tenant_id', tenantId).eq('source', 'sale')
+  if (deleteError) throw deleteError
+
+  const numbers = books.journals.filter(journal => journal.source !== 'sale').map(journal => journal.number)
+  const drafts = expected.map(draft => {
+    const number = nextJournalNumber(numbers.map(value => ({ number: value }) as JournalEntry))
+    numbers.push(number)
+    return { ...draft, number }
+  })
+
+  const idByRef = new Map<string, string>()
+  for (let index = 0; index < drafts.length; index += 80) {
+    const slice = drafts.slice(index, index + 80)
+    const { data, error } = await supabase
+      .from('journal_entries')
+      .insert(slice.map(draft => ({
+        tenant_id: tenantId,
+        entry_no: draft.number,
+        entry_date: draft.date.slice(0, 10),
+        source: draft.source,
+        source_ref: draft.sourceRef,
+        memo: draft.memo,
+      })))
+      .select('id, source_ref')
+    if (error) throw error
+    for (const row of data || []) idByRef.set(String(row.source_ref), String(row.id))
+  }
+
+  const lineRows = drafts.flatMap(draft => {
+    const journalId = idByRef.get(draft.sourceRef)
+    if (!journalId) throw new Error(`Could not post the sale journal for ${draft.sourceRef}`)
+    return draft.lines.map((line, sort) => ({
+      tenant_id: tenantId,
+      journal_id: journalId,
+      account_id: line.accountId,
+      description: line.description,
+      party_name: line.partyName,
+      debit: line.debit,
+      credit: line.credit,
+      sort_order: sort,
+    }))
+  })
+  for (let index = 0; index < lineRows.length; index += 400) {
+    const { error } = await supabase.from('journal_lines').insert(lineRows.slice(index, index + 400))
+    if (error) throw error
+  }
+  return { ...books, journals: await fetchJournals(tenantId, books.accounts) }
 }
 
 export async function postSaleJournal(tenantId: string, accounts: GlAccount[], journals: JournalEntry[], order: Order, vatRegistered: boolean) {

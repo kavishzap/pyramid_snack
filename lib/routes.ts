@@ -8,6 +8,7 @@ export type PageKey =
   | 'orders'
   | 'expenses'
   | 'purchases'
+  | 'accounts'
   | 'journals'
   | 'ledger'
   | 'cashbook'
@@ -25,6 +26,7 @@ export const PAGE_PATH: Record<PageKey, string> = {
   menu: '/menu',
   categories: '/categories',
   purchases: '/purchases',
+  accounts: '/accounts',
   journals: '/journals',
   ledger: '/ledger',
   cashbook: '/cashbook',
@@ -45,7 +47,8 @@ export const PAGE_TITLES: Record<PageKey, [string, string]> = {
   orders: ['Orders', 'Tickets with menu items, add-ons, table, and status.'],
   expenses: ['Expenses', 'Track the cost of doing good work.'],
   purchases: ['Purchases of goods', 'Supplier invoices paid from cash or bank.'],
-  journals: ['Journal entries', 'Chart of accounts and postings into the ledger.'],
+  accounts: ['Chart of accounts', 'Account codes used by the journal book and ledger.'],
+  journals: ['Journal book', 'Posted journals and manual entries.'],
   ledger: ['General ledger', 'Trial balance and account movements.'],
   cashbook: ['Cash book', 'Cash on hand and bank.'],
   pnl: ['P&L', 'Mauritian profit and loss statement from orders and expenses.'],

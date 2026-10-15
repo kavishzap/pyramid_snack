@@ -248,7 +248,13 @@ const cashOrBank = (accounts: GlAccount[], method: PayMethod | SettleMethod) =>
 
 export function buildSaleJournal(accounts: GlAccount[], order: Order, vatRegistered: boolean): Omit<JournalEntry, 'id' | 'number'> | null {
   if (order.status !== 'Completed') return null
-  const { subtotal, discount, total: net } = settleOrderAmounts(order)
+  const settled = settleOrderAmounts(order)
+  const storedTotal = roundMoney(Number(order.total) || 0)
+  // The sales report uses the amount collected on the order. Line prices can drift from that figure.
+  const useStoredTotal = storedTotal > 0 && Math.abs(storedTotal - settled.total) > 0.02
+  const subtotal = useStoredTotal ? storedTotal : settled.subtotal
+  const discount = useStoredTotal ? 0 : settled.discount
+  const net = useStoredTotal ? storedTotal : settled.total
   if (subtotal <= 0 && net <= 0) return null
   const method = order.paymentMethod || 'cash'
   const gross = vatSplit(subtotal, vatRegistered)
@@ -439,14 +445,13 @@ export function trialBalance(books: AccountingBooks): TrialBalanceRow[] {
     .map(account => {
       const row = byId.get(account.id) || { debit: 0, credit: 0 }
       const raw = roundMoney(row.debit - row.credit)
-      const normalDebit = account.type === 'asset' || account.type === 'expense'
       return {
         account,
         debit: roundMoney(row.debit),
         credit: roundMoney(row.credit),
         balance: raw,
-        displayDebit: normalDebit ? Math.max(raw, 0) : Math.max(-raw, 0),
-        displayCredit: normalDebit ? Math.max(-raw, 0) : Math.max(raw, 0),
+        displayDebit: raw > 0 ? raw : 0,
+        displayCredit: raw < 0 ? roundMoney(-raw) : 0,
       }
     })
     .filter(row => row.debit || row.credit)

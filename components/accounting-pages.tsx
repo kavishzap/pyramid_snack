@@ -17,8 +17,10 @@ import {
   defaultVatFlags,
   documentVat,
   journalTotals,
+  ACCOUNT_CODES,
   money,
   nextPurchaseNumber,
+  roundMoney,
   purchaseTotal,
   removeJournal,
   trialBalance,
@@ -473,7 +475,7 @@ const ACCOUNT_TYPES: { value: AccountType; label: string }[] = [
   { value: 'expense', label: 'Expense' },
 ]
 
-function ChartOfAccountsSection({ books, setBooks, tenantId, toast, reload }: BooksProps) {
+export function ChartOfAccountsPage({ books, setBooks, tenantId, toast, reload }: BooksProps) {
   const [editing, setEditing] = useState<GlAccount | null>(null)
   const [pendingDelete, setPendingDelete] = useState<GlAccount | null>(null)
   const paged = usePagedRows(books.accounts)
@@ -533,7 +535,7 @@ function ChartOfAccountsSection({ books, setBooks, tenantId, toast, reload }: Bo
   }
 
   return (
-    <>
+    <div className="page-content">
       <Card className="table-card">
         <div className="table-summary">
           <div>
@@ -636,7 +638,7 @@ function ChartOfAccountsSection({ books, setBooks, tenantId, toast, reload }: Bo
           </div>
         </Dialog>
       )}
-    </>
+    </div>
   )
 }
 
@@ -699,7 +701,6 @@ export function JournalsPage({ books, setBooks, tenantId, toast, reload }: Books
 
   return (
     <div className="page-content">
-      <ChartOfAccountsSection books={books} setBooks={setBooks} tenantId={tenantId} vatOn={false} toast={toast} reload={reload} />
       <div className="page-toolbar">
         <p className="muted">Every sale, purchase, receipt, payment, and expense posts here. Use a manual entry for adjustments, opening balances, or year-end journals.</p>
         <Button onClick={() => setEditing(blank())}><Plus size={17} /> Manual entry</Button>
@@ -826,6 +827,10 @@ export function LedgerPage({ books, company, toast }: { books: AccountingBooks; 
   const account = books.accounts.find(item => item.id === accountId)
   const debitTotal = rows.reduce((sum, row) => sum + row.displayDebit, 0)
   const creditTotal = rows.reduce((sum, row) => sum + row.displayCredit, 0)
+  const collectedSales = roundMoney(rows.reduce((sum, row) => {
+    if (row.account.code !== ACCOUNT_CODES.sales && row.account.code !== ACCOUNT_CODES.outputVat) return sum
+    return sum + row.displayCredit - row.displayDebit
+  }, 0))
 
   const downloadPdf = async () => {
     setDownloading(true)
@@ -871,7 +876,7 @@ export function LedgerPage({ books, company, toast }: { books: AccountingBooks; 
           },
         ],
         notes: [
-          'Trial balance includes posted journals only. Debit and credit columns are the closing position of each account.',
+          'Restaurant sales is income excluding VAT. Output VAT payable is the tax on those sales. Cash on hand is the till after cash received and cash paid out.',
           'The account ledger matches the account selected on screen.',
         ],
       })
@@ -886,7 +891,11 @@ export function LedgerPage({ books, company, toast }: { books: AccountingBooks; 
   return (
     <div className="page-content">
       <div className="page-toolbar">
-        <p className="muted">Trial balance from posted journals, plus movements on the selected account.</p>
+        <p className="muted">
+          {collectedSales > 0
+            ? `Sales collected ${money(collectedSales)}, including VAT. Restaurant sales is that income with VAT taken out. Cash on hand is what is still in the till after cash sales and cash paid out.`
+            : 'Trial balance from posted journals, plus movements on the selected account.'}
+        </p>
         <PdfDownloadButton downloading={downloading} onClick={() => void downloadPdf()} />
       </div>
       <Card className="table-card">

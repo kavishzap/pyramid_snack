@@ -4,7 +4,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { BarChart3, BookMarked, BookOpen, Boxes, CalendarDays, Check, ChevronLeft, ChevronRight, CircleDollarSign, ClipboardList, Download, Eye, LayoutDashboard, LogOut, Menu as MenuIcon, Moon, MoreHorizontal, Plus, Receipt, Search, Settings, Sparkles, Store, Sun, Table2, Tags, TrendingUp, Users, Wallet, X, Trash2, ShoppingCart, ScrollText } from 'lucide-react'
+import { BarChart3, BookMarked, BookOpen, Boxes, CalendarDays, Check, ChevronLeft, ChevronRight, CircleDollarSign, ClipboardList, Download, Eye, LayoutDashboard, ListTree, LogOut, Menu as MenuIcon, Moon, MoreHorizontal, Plus, Receipt, Search, Settings, Sparkles, Store, Sun, Table2, Tags, TrendingUp, Users, Wallet, X, Trash2, ShoppingCart, ScrollText } from 'lucide-react'
 
 import {
   type Category,
@@ -29,7 +29,7 @@ import {
 import { isSupabaseConfigured } from '@/lib/supabase/client'
 import * as api from '@/lib/api/restaurant'
 import * as booksApi from '@/lib/api/accounting'
-import { CashBookPage, JournalsPage, LedgerPage, PurchasesPage, VatBreakdown, VatToggleRow } from '@/components/accounting-pages'
+import { CashBookPage, ChartOfAccountsPage, JournalsPage, LedgerPage, PurchasesPage, VatBreakdown, VatToggleRow } from '@/components/accounting-pages'
 import {
   type AccountingBooks,
   type Purchase,
@@ -777,7 +777,8 @@ const navSections = [
     title: 'Accounting',
     items: [
       ['purchases', 'Purchases', ShoppingCart],
-      ['journals', 'Journals', ScrollText],
+      ['accounts', 'Chart of accounts', ListTree],
+      ['journals', 'Journal book', ScrollText],
       ['ledger', 'Ledger', BookMarked],
       ['cashbook', 'Cash book', Wallet],
     ],
@@ -3673,7 +3674,14 @@ export default function BackOfficeApp({ children }: { children?: React.ReactNode
     setExpenses(workspace.expenses)
     setExpenseCategoryMap(workspace.expenseCategories)
     try {
-      setBooks(await booksApi.loadBooks(workspace.tenantId))
+      const books = await booksApi.loadBooks(workspace.tenantId)
+      try {
+        setBooks(await booksApi.syncSaleJournals(workspace.tenantId, books, workspace.orders, workspace.company.vatRegistered))
+      } catch (err) {
+        console.error(err)
+        setBooks(books)
+        toast(err instanceof Error ? err.message : 'Could not update the sales ledger')
+      }
     } catch (err) {
       console.error(err)
       setBooks(emptyBooks())
@@ -3888,6 +3896,7 @@ export default function BackOfficeApp({ children }: { children?: React.ReactNode
         {matched === 'orders' && <Orders orders={orders} setOrders={setOrders} menu={menu} company={company} toast={toast} tenantId={tenantId} onPosted={postSale} />}
         {matched === 'expenses' && <Expenses expenses={expenses} setExpenses={setExpenses} company={company} toast={toast} tenantId={tenantId} expenseCategoryMap={expenseCategoryMap} onPosted={postExpense} />}
         {matched === 'purchases' && <PurchasesPage books={books} setBooks={setBooks} tenantId={tenantId} vatOn={company.vatRegistered} toast={toast} reload={refreshWorkspace} company={company} />}
+        {matched === 'accounts' && <ChartOfAccountsPage books={books} setBooks={setBooks} tenantId={tenantId} vatOn={company.vatRegistered} toast={toast} reload={refreshWorkspace} />}
         {matched === 'journals' && <JournalsPage books={books} setBooks={setBooks} tenantId={tenantId} vatOn={company.vatRegistered} toast={toast} reload={refreshWorkspace} />}
         {matched === 'ledger' && <LedgerPage books={books} company={company} toast={toast} />}
         {matched === 'cashbook' && <CashBookPage books={books} company={company} toast={toast} />}
